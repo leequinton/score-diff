@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Generated tensors (regenerate via data/prep_factors_daily.py) ---
+data/processed/
+
+# --- Model checkpoints (regenerate via training) ---
+checkpoints/
+
+# --- Results: plots, loss logs, multiseed JSON (regenerate via training) ---
+results/
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
