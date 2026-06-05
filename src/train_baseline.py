@@ -14,34 +14,49 @@ from src.diffusion.sde import VPSDE
 from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
     logcov_to_correlation, logcov_to_covariance, eval_and_plot,
-    regime_sweep_summary, variance_diagnostics,
+    plot_sample_matrices, gmvp_diagnostics, regime_sweep_summary,
+    variance_diagnostics,
 )
 from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
 
 ROOT = Path(__file__).resolve().parents[1]
 
-FREQ   = "daily"
-SUFFIX = "_daily" if FREQ == "daily" else ""
-GAP    = 12 if FREQ == "daily" else 0
+# --- data source -------------------------------------------------------------
+# "empirical" : rolling-window matrices from the FF industry data
+# "sim"       : the calibrated DCC-GARCH covariance path (src/sim/dcc.py -> prepare_sim)
+SOURCE = "sim"
 
-# "correlation" diffuses the matrix log of empirical correlation matrices (the standard baseline)
-# "covariance" diffuses the matrix log of empirical covariance matrices, capturing per-asset scale
+# "correlation" diffuses the matrix log of correlation matrices (the standard baseline)
+# "covariance" diffuses the matrix log of covariance matrices, capturing per-asset scale.
+# GMVP needs the scales + Sigma^-1, so the portfolio application uses "covariance".
+TARGET = "covariance"
 
-TARGET = "correlation"
-TAG    = "_cov" if TARGET == "covariance" else ""
-DATA_FILE = "Cov_empirical" if TARGET == "covariance" else "C_empirical"
+if SOURCE == "empirical":
+    SUFFIX = "_daily"
+    GAP    = 12
+    COR_FILE, COV_FILE, COND_FILE = "C_empirical_daily", "Cov_empirical_daily", "cond_daily"
+elif SOURCE == "sim":
+    # one long, highly autocorrelated path -> bigger train/val gap, no conditioning series
+    SUFFIX = "_sim"
+    GAP    = 250
+    COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", None
+else:
+    raise ValueError(f"unknown SOURCE {SOURCE!r}")
 
-DATA_PATH = ROOT / "data" / "processed" / f"{DATA_FILE}{SUFFIX}.pt"
-C_PATH    = ROOT / "data" / "processed" / f"C_empirical{SUFFIX}.pt"    # correlation eval target
-COV_PATH  = ROOT / "data" / "processed" / f"Cov_empirical{SUFFIX}.pt"  # covariance target
-COND_PATH = ROOT / "data" / "processed" / f"cond{SUFFIX}.pt"
+TAG       = "_cov" if TARGET == "covariance" else ""
+DATA_FILE = COV_FILE if TARGET == "covariance" else COR_FILE
+DATA_PATH = ROOT / "data" / "processed" / f"{DATA_FILE}.pt"
+C_PATH    = ROOT / "data" / "processed" / f"{COR_FILE}.pt"   # correlation eval target
+COV_PATH  = ROOT / "data" / "processed" / f"{COV_FILE}.pt"   # covariance target
+COND_PATH = (ROOT / "data" / "processed" / f"{COND_FILE}.pt") if COND_FILE else None
 
 
 def output_paths(seed):
     return dict(
         ckpt        = ROOT / "checkpoints" / f"logcov_score{SUFFIX}{TAG}_seed{seed}.pt",
         plot        = ROOT / "results"     / f"real_vs_generated_baseline{SUFFIX}{TAG}_seed{seed}.png",
+        samples     = ROOT / "results"     / f"sample_matrices{SUFFIX}{TAG}_seed{seed}.png",
         log         = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.csv",
         loss_plot   = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.png",
         regime_plot = ROOT / "results"     / f"regime_sweep_baseline{SUFFIX}{TAG}_seed{seed}.png",
@@ -55,9 +70,9 @@ CFG = dict(
     batch_size=64,
     lr=2e-4,
     weight_decay=1e-5,
-    n_steps=8_000,
-    val_every=500,
-    log_every=100,
+    n_epochs=50,           # passes over the train set; steps derived from dataset size
+    val_every_epochs=2,    # validate every k epochs
+    log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
     n_samples=500,
@@ -88,6 +103,15 @@ def main(cfg=CFG):
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"])
 
+    # Training schedule is specified in epochs; convert to steps so the amount of
+    # training is invariant to dataset size (sim has ~20x more windows than empirical).
+    steps_per_epoch = len(train_loader)
+    n_steps = cfg["n_epochs"] * steps_per_epoch
+    val_every = max(1, round(cfg["val_every_epochs"] * steps_per_epoch))
+    log_every = cfg["log_every"]
+    print(f"epochs: {cfg['n_epochs']}  steps/epoch: {steps_per_epoch}  "
+          f"total steps: {n_steps}  val every: {val_every} steps")
+
     model = LogCovScoreGNN(
         n_assets=n_assets,
         hidden_dim=cfg["hidden_dim"],
@@ -115,7 +139,7 @@ def main(cfg=CFG):
         train_iter = cycle(train_loader)
         t0 = time.time()
         cond_dropout_train = cfg.get("cond_dropout", 0.1) if use_cond else 0.0
-        for step in range(1, cfg["n_steps"] + 1):
+        for step in range(1, n_steps + 1):
             batch = next(train_iter)
             if use_cond:
                 X0, cond0 = batch[0].to(device), batch[1].to(device)
@@ -130,7 +154,7 @@ def main(cfg=CFG):
             ema.update(model)
 
             val_loss_avg = None
-            if step % cfg["val_every"] == 0:
+            if step % val_every == 0:
                 with ema.swap_in(model), torch.no_grad():
                     vlosses = []
                     for vb in val_loader:
@@ -148,8 +172,9 @@ def main(cfg=CFG):
                     best_step = step
                     best_ema_shadow = {n: v.detach().clone() for n, v in ema.shadow.items()}
 
-            if step % cfg["log_every"] == 0:
-                print(f"step {step:>6d}  train_loss {loss.item():.4f}  ({(time.time()-t0)/step:.3f}s/step)")
+            if step % log_every == 0:
+                print(f"epoch {step/steps_per_epoch:5.1f}  step {step:>6d}  "
+                      f"train_loss {loss.item():.4f}  ({(time.time()-t0)/step:.3f}s/step)")
                 if val_loss_avg is not None:
                     marker = "  **new best**" if step == best_step else ""
                     print(f"           val_loss   {val_loss_avg:.4f}{marker}")
@@ -201,12 +226,15 @@ def main(cfg=CFG):
 
     paths["plot"].parent.mkdir(parents=True, exist_ok=True)
     stats = eval_and_plot(C_real, C_gen, paths["plot"], n_inv_gen=n_inv)
+    plot_sample_matrices(C_real, C_gen, paths["samples"])
+    print(f"saved samples -> {paths['samples']}")
 
     # same as train.py only if target set to covariance
     if TARGET == "covariance":
         Sigma_gen = logcov_to_covariance(S_gen)
         Cov_real = torch.load(COV_PATH, weights_only=True).float()[-len(val_ds):]
         stats.update(variance_diagnostics(Cov_real, Sigma_gen))
+        stats.update(gmvp_diagnostics(Cov_real, Sigma_gen))
 
     print(f"saved plot -> {paths['plot']}")
     for k, v in stats.items():

@@ -46,6 +46,67 @@ def logcov_to_correlation(S):
     return to_correlation(logcov_to_covariance(S))
 
 
+def gmvp_weights(Sigma, ridge=0.0):
+    """Global minimum-variance weights w = Sigma^-1 1 / (1' Sigma^-1 1),
+    unconstrained (long-short allowed). Sigma: (..., N, N) -> (..., N).
+    In the log representation note Sigma^-1 = expm(-S), so these weights are a
+    smooth function of the modeled matrix log."""
+    N = Sigma.shape[-1]
+    if ridge > 0:
+        Sigma = Sigma + ridge * torch.eye(N, device=Sigma.device, dtype=Sigma.dtype)
+    ones = torch.ones(*Sigma.shape[:-1], 1, device=Sigma.device, dtype=Sigma.dtype)
+    x = torch.linalg.solve(Sigma, ones)              # Sigma^-1 1, (..., N, 1)
+    w = x / x.sum(dim=-2, keepdim=True)
+    return w.squeeze(-1)                             # (..., N)
+
+
+def gmvp_diagnostics(Cov_real, Sigma_gen):
+    """GMVP distributional-fidelity eval for an unconditional generator.
+
+    Sigma_bar = mean_t Cov_real is the population (realized) covariance over the
+    validation period; realized variance of any weight is w' Sigma_bar w. The
+    reference points, from best to naive:
+
+      oracle      GMVP(Sigma_bar)                 - lower bound (needs the population cov)
+      truesample  mean_t var of GMVP(H_t)         - ceiling a per-sample generator can hit
+                                                    (each single draw pays an estimation penalty,
+                                                    so this is ~2x oracle, not 1x)
+      gen         mean_i var of GMVP(Sigma_gen_i) - the model, used one sample at a time
+      genbar      GMVP(mean_i Sigma_gen_i)        - the model, denoised by averaging samples
+                                                    (-> oracle if the model's mean is right)
+      equalwt     1/N portfolio                   - naive floor
+
+    So `ratio_gen` should be read against `ratio_truesample` (matching it = the
+    samples are as useful as real covariances), and `genbar` against `oracle`
+    (matching it = the model's mean recovers the population). Gross leverage 1'|w|
+    flags ill-conditioned generated covariances (extreme short positions).
+    """
+    N = Cov_real.shape[-1]
+    Sigma_bar = Cov_real.mean(0)                     # (N, N) population covariance
+
+    def realized_var(w):                            # w: (..., N) -> (...)
+        return ((w @ Sigma_bar) * w).sum(-1)
+
+    v_oracle = float(realized_var(gmvp_weights(Sigma_bar)))
+    v_true = realized_var(gmvp_weights(Cov_real))    # (T,) per-period true-cov GMVP
+    w_gen = gmvp_weights(Sigma_gen)                  # (n, N)
+    v_gen = realized_var(w_gen)                      # (n,)
+    v_genbar = float(realized_var(gmvp_weights(Sigma_gen.mean(0))))
+    v_ew = float(realized_var(torch.full((N,), 1.0 / N)))
+
+    return {
+        "gmvp_var_oracle":       v_oracle,
+        "gmvp_var_truesample":   float(v_true.mean()),
+        "gmvp_var_gen_mean":     float(v_gen.mean()),
+        "gmvp_var_gen_median":   float(v_gen.median()),
+        "gmvp_var_genbar":       v_genbar,
+        "gmvp_var_equalwt":      v_ew,
+        "gmvp_ratio_gen":        float(v_gen.mean()) / v_oracle,
+        "gmvp_ratio_truesample": float(v_true.mean()) / v_oracle,
+        "gmvp_gross_lev_gen":    float(w_gen.abs().sum(-1).mean()),
+    }
+
+
 def w1_offdiag(C_real, C_gen):
     """1-D Wasserstein-1 on the pooled distribution of off-diagonal correlations."""
     a = _offdiag(C_real).flatten().numpy()
@@ -205,6 +266,34 @@ def regime_sweep_summary(C_gen_list, cond_values_raw, save_path=None, label=""):
         plt.close(fig)
 
     return rows
+
+
+def plot_sample_matrices(C_real, C_gen, save_path, n=5, seed=0):
+    """Heatmap grid for a quick visual plausibility check: n real (top row) vs n
+    generated (bottom row) correlation matrices on a shared diverging scale [-1, 1].
+    Shows whether generated matrices reproduce block/sector structure, not just
+    aggregate statistics."""
+    rng = np.random.default_rng(seed)
+    n = min(n, len(C_real), len(C_gen))
+    ridx = rng.choice(len(C_real), size=n, replace=False)
+    gidx = rng.choice(len(C_gen), size=n, replace=False)
+
+    fig, axes = plt.subplots(2, n, figsize=(3 * n, 6.4))
+    axes = np.atleast_2d(axes)
+    for col in range(n):
+        for row, (C, idx, lbl) in enumerate(
+            [(C_real, ridx[col], "real"), (C_gen, gidx[col], "generated")]
+        ):
+            ax = axes[row, col]
+            im = ax.imshow(C[idx].numpy(), vmin=-1, vmax=1, cmap="RdBu_r")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(lbl, fontsize=13)
+    fig.suptitle("Sample correlation matrices: real (top) vs generated (bottom)")
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="correlation")
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
 
 
 def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):

@@ -1,9 +1,3 @@
-"""CSV loaders for the Ken French daily files.
-
-Auto-detects the header line, keeps only the value-weighted block (dropping the
-equal-weighted / annual section and footer), and maps the -99.99/-999 missing
-codes to NaN. Used by the DCC-GARCH simulation in src/sim.
-"""
 import numpy as np
 import pandas as pd
 
