@@ -1,4 +1,4 @@
-"""Euler-Maruyama reverse-SDE sampler for the full-Cholesky baseline.
+"""Euler-Maruyama reverse-SDE sampler for the log-covariance baseline.
 
 Supports optional classifier-free guidance (Ho and Salimans, 2022):
 
@@ -14,6 +14,8 @@ sampling cost roughly doubles.
 
 import torch
 
+from src.diffusion.losses import sym_randn_like
+
 
 def _cfg_combine(eps_cond, eps_uncond, w):
     """Classifier-free-guidance combination: (1+w)·cond − w·uncond."""
@@ -21,12 +23,13 @@ def _cfg_combine(eps_cond, eps_uncond, w):
 
 
 @torch.no_grad()
-def sample_full_chol(model, sde, batch_size, n_assets, device, eps_t=1e-3,
-                     cond=None, guidance_scale=0.0):
-    """Reverse-SDE Euler-Maruyama for the full Cholesky baseline."""
+def sample_logcov(model, sde, batch_size, n_assets, device, eps_t=1e-3,
+                  cond=None, guidance_scale=0.0):
+    """Reverse-SDE Euler-Maruyama for the log-covariance baseline. The iterate
+    stays symmetric: the model output is symmetric and the injected noise is
+    symmetric, and the per-entry SDE coefficients preserve that symmetry."""
     N = n_assets
-    tril = torch.tril(torch.ones(N, N, device=device))
-    X = torch.randn(batch_size, N, N, device=device) * tril
+    X = sym_randn_like(torch.empty(batch_size, N, N, device=device))
 
     timesteps = torch.linspace(sde.T, eps_t, sde.N, device=device)
     use_cfg = (cond is not None) and (guidance_scale != 0.0)
@@ -48,8 +51,8 @@ def sample_full_chol(model, sde, batch_size, n_assets, device, eps_t=1e-3,
 
         X = X - rev_f
         if i < sde.N - 1:
-            z = torch.randn_like(X) * tril
+            z = sym_randn_like(X)
             X = X + G[:, None, None] * z
-        X = (X * tril).clamp(-8, 8)
+        X = X.clamp(-8, 8)
 
     return X

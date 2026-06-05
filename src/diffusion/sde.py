@@ -8,7 +8,7 @@ which is equivalent to a unit-step Euler-Maruyama discretisation of the SDE.
 
 Shape-agnostic: every method accepts `x` of any rank and broadcasts the
 per-batch scalar coefficients across the trailing dimensions via `_bcast`.
-The bipartite (B, L, D) and full-Cholesky (N x N tril) models call the same
+The bipartite (B, L, D) and log-covariance (N x N symmetric) models call the same
 methods on tensors of different shape.
 """
 

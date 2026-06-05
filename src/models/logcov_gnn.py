@@ -19,12 +19,12 @@ class TransformerBlock(nn.Module):
         return h
 
 
-class FullCholScoreGNN(nn.Module):
-    """Score network for the full N x N Cholesky factor.
+class LogCovScoreGNN(nn.Module):
+    """Score network for the symmetric matrix-log S = logm(Sigma).
 
-    x : (batch, N, N) lower-triangular
+    x : (batch, N, N) symmetric
     t : (batch,) diffusion time in [0, 1]
-    returns (batch, N, N), lower-triangular noise prediction
+    returns (batch, N, N), symmetric noise prediction
     """
 
     def __init__(self, n_assets, hidden_dim=128, n_layers=4, n_heads=4,
@@ -46,7 +46,6 @@ class FullCholScoreGNN(nn.Module):
         )
         self.ln_out = nn.LayerNorm(hidden_dim)
         self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.register_buffer("tril_mask", torch.tril(torch.ones(n_assets, n_assets)))
 
     def forward(self, x, t, cond=None, cond_mask=None):
         h = self.embed(x) + self.pos
@@ -60,4 +59,4 @@ class FullCholScoreGNN(nn.Module):
             h = h + t_bias
         h = self.ln_out(h)
         out = h @ self.W(h).transpose(-1, -2)
-        return out * self.tril_mask
+        return 0.5 * (out + out.transpose(-1, -2))

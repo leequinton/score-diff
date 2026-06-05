@@ -33,9 +33,17 @@ def to_correlation(Sigma):
     return C.clamp(-1.0, 1.0), (~valid).sum().item()
 
 
-def chol_to_correlation(L_full):
-    """Lower-triangular L (N x N) -> normalized correlation matrices."""
-    return to_correlation(L_full @ L_full.transpose(-1, -2))
+def logcov_to_covariance(S):
+    """Symmetric matrix-log S (N x N) -> covariance Sigma = expm(S) via the
+    eigendecomposition: expm(Q diag(w) Q^T) = Q diag(exp w) Q^T. expm maps any
+    symmetric matrix to an SPD one, so the reconstruction is unconstrained."""
+    w, Q = torch.linalg.eigh(S)
+    return (Q * w.exp().unsqueeze(-2)) @ Q.transpose(-1, -2)
+
+
+def logcov_to_correlation(S):
+    """Symmetric matrix-log S (N x N) -> normalized correlation matrices."""
+    return to_correlation(logcov_to_covariance(S))
 
 
 def w1_offdiag(C_real, C_gen):

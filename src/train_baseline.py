@@ -8,14 +8,15 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from src.data.dataset import make_full_chol_datasets
-from src.diffusion.losses import vpsde_dsm_loss_chol
+from src.data.dataset import make_logcov_datasets
+from src.diffusion.losses import vpsde_dsm_loss_logcov
 from src.diffusion.sde import VPSDE
-from src.diffusion.solver import sample_full_chol
+from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
-    chol_to_correlation, eval_and_plot, regime_sweep_summary, variance_diagnostics,
+    logcov_to_correlation, logcov_to_covariance, eval_and_plot,
+    regime_sweep_summary, variance_diagnostics,
 )
-from src.models.full_chol_gnn import FullCholScoreGNN
+from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +25,8 @@ FREQ   = "daily"
 SUFFIX = "_daily" if FREQ == "daily" else ""
 GAP    = 12 if FREQ == "daily" else 0
 
-# "correlation" aims to create an unstructured Cholesky on empirical correlation matrices (the standard baseline)
-# "covariance" baseline model aiming to capture covariance structure
+# "correlation" diffuses the matrix log of empirical correlation matrices (the standard baseline)
+# "covariance" diffuses the matrix log of empirical covariance matrices, capturing per-asset scale
 
 TARGET = "correlation"
 TAG    = "_cov" if TARGET == "covariance" else ""
@@ -39,7 +40,7 @@ COND_PATH = ROOT / "data" / "processed" / f"cond{SUFFIX}.pt"
 
 def output_paths(seed):
     return dict(
-        ckpt        = ROOT / "checkpoints" / f"full_chol_score{SUFFIX}{TAG}_seed{seed}.pt",
+        ckpt        = ROOT / "checkpoints" / f"logcov_score{SUFFIX}{TAG}_seed{seed}.pt",
         plot        = ROOT / "results"     / f"real_vs_generated_baseline{SUFFIX}{TAG}_seed{seed}.png",
         log         = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.csv",
         loss_plot   = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.png",
@@ -77,7 +78,7 @@ def main(cfg=CFG):
     use_cond = cond_dim > 0
     print(f"device: {device}  seed: {seed}  cond_dim: {cond_dim}")
 
-    train_ds, val_ds, norm = make_full_chol_datasets(
+    train_ds, val_ds, norm = make_logcov_datasets(
         DATA_PATH, gap=GAP, cond_path=COND_PATH if use_cond else None, target=TARGET,
     )
     n_assets = train_ds.X.shape[-1]
@@ -87,7 +88,7 @@ def main(cfg=CFG):
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"])
 
-    model = FullCholScoreGNN(
+    model = LogCovScoreGNN(
         n_assets=n_assets,
         hidden_dim=cfg["hidden_dim"],
         n_layers=cfg["n_layers"],
@@ -120,8 +121,8 @@ def main(cfg=CFG):
                 X0, cond0 = batch[0].to(device), batch[1].to(device)
             else:
                 X0, cond0 = batch.to(device), None
-            loss = vpsde_dsm_loss_chol(model, sde, X0, eps_t=cfg["eps_t"],
-                                        cond=cond0, cond_dropout=cond_dropout_train)
+            loss = vpsde_dsm_loss_logcov(model, sde, X0, eps_t=cfg["eps_t"],
+                                         cond=cond0, cond_dropout=cond_dropout_train)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -137,9 +138,9 @@ def main(cfg=CFG):
                             Xv, condv = vb[0].to(device), vb[1].to(device)
                         else:
                             Xv, condv = vb.to(device), None
-                        vlosses.append(vpsde_dsm_loss_chol(model, sde, Xv,
-                                                            eps_t=cfg["eps_t"],
-                                                            cond=condv, cond_dropout=0.0).item())
+                        vlosses.append(vpsde_dsm_loss_logcov(model, sde, Xv,
+                                                             eps_t=cfg["eps_t"],
+                                                             cond=condv, cond_dropout=0.0).item())
                 val_loss_avg = sum(vlosses) / len(vlosses)
 
                 if val_loss_avg < best_val_loss:
@@ -186,14 +187,14 @@ def main(cfg=CFG):
           f"guidance_scale={cfg.get('guidance_scale', 0.0)})...")
     with ema.swap_in(model):
         model.eval()
-        L_gen_n = sample_full_chol(
+        S_gen_n = sample_logcov(
             model, sde, cfg["n_samples"], n_assets,
             device=device, eps_t=cfg["eps_t"],
             cond=sample_cond, guidance_scale=cfg.get("guidance_scale", 0.0),
         )
 
-    L_gen = norm.denormalize(L_gen_n).cpu()
-    C_gen, n_inv = chol_to_correlation(L_gen)
+    S_gen = norm.denormalize(S_gen_n).cpu()
+    C_gen, n_inv = logcov_to_correlation(S_gen)
 
     C_real_all = torch.load(C_PATH, weights_only=True).float()
     C_real = C_real_all[-len(val_ds):]
@@ -203,7 +204,7 @@ def main(cfg=CFG):
 
     # same as train.py only if target set to covariance
     if TARGET == "covariance":
-        Sigma_gen = L_gen @ L_gen.transpose(-1, -2)
+        Sigma_gen = logcov_to_covariance(S_gen)
         Cov_real = torch.load(COV_PATH, weights_only=True).float()[-len(val_ds):]
         stats.update(variance_diagnostics(Cov_real, Sigma_gen))
 
@@ -220,10 +221,10 @@ def main(cfg=CFG):
             model.eval()
             for c_norm in sweep_levels_norm:
                 c_tensor = torch.full((sweep_n, cond_dim), c_norm, device=device)
-                L_g = sample_full_chol(model, sde, sweep_n, n_assets,
-                                        device=device, eps_t=cfg["eps_t"],
-                                        cond=c_tensor, guidance_scale=0.0)
-                C_, _ = chol_to_correlation(norm.denormalize(L_g).cpu())
+                S_g = sample_logcov(model, sde, sweep_n, n_assets,
+                                    device=device, eps_t=cfg["eps_t"],
+                                    cond=c_tensor, guidance_scale=0.0)
+                C_, _ = logcov_to_correlation(norm.denormalize(S_g).cpu())
                 c_raw = norm.denormalize_cond(c_tensor[:1])[0, 0].item()
                 C_gen_list.append(C_)
                 cond_raw_list.append(c_raw)
