@@ -83,7 +83,7 @@ CFG = dict(
     lr_schedule="cosine",  # "cosine" (linear warmup -> cosine decay) or "constant"
     warmup_frac=0.05,      # fraction of total steps spent linearly warming up
     min_lr_ratio=0.05,     # cosine floor, as a fraction of peak lr
-    n_steps=30_000,        # total optimizer steps (dataset-size-independent; anchors the LR cosine)
+    n_steps=20_000,        # total optimizer steps (dataset-size-independent; anchors the LR cosine)
     val_every=1_000,       # validate every k steps
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
@@ -91,7 +91,7 @@ CFG = dict(
     n_samples=500,
     eps_t=1e-3,
     seed=42,
-    cond_dim=0,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
+    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
     cond_dropout=0.1,
     guidance_scale=0.0,
 )
