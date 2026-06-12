@@ -7,6 +7,7 @@ sliced over flattened upper-triangles for joint structure)."""
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
 from scipy.stats import wasserstein_distance
 from scipy.cluster.hierarchy import linkage, cophenet
 from scipy.spatial.distance import squareform
@@ -289,21 +290,25 @@ def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance
     generated (bottom row) matrices. Shows whether generated matrices reproduce
     block/sector structure, not just aggregate statistics.
 
-    kind="correlation" uses the fixed diverging scale [-1, 1]. kind="covariance"
-    derives a shared symmetric scale from a robust (99.5th) percentile of the
-    displayed real entries, so the colour scale is comparable across the two rows
-    and a few large variance diagonals don't wash out the off-diagonal structure
-    (those diagonals saturate, which is fine — they're not the point of the plot)."""
+    kind="correlation" uses the fixed diverging scale [-1, 1] (correlations are
+    genuinely signed). kind="covariance" uses a *sequential* 0->vmax scale with
+    gamma compression: covariance entries are almost all positive, so a symmetric
+    diverging map wastes half its range and renders the bulk as washed-out pale
+    pink. PowerNorm(gamma<1) expands the low end so the off-diagonal structure
+    shows, while the high-variance entries saturate (vmax = robust 99th percentile
+    of the displayed real matrices, shared across both rows for comparability)."""
     rng = np.random.default_rng(seed)
     n = min(n, len(M_real), len(M_gen))
     ridx = rng.choice(len(M_real), size=n, replace=False)
     gidx = rng.choice(len(M_gen), size=n, replace=False)
 
     if kind == "correlation":
-        vmax, cbar_label, title_word = 1.0, "correlation", "correlation"
+        cmap, norm, vmin, vmax = "RdBu_r", None, -1.0, 1.0
+        cbar_label = title_word = "correlation"
     else:
-        vmax = float(np.percentile(np.abs(M_real[ridx].numpy()), 99.5))
-        cbar_label, title_word = "covariance", "covariance"
+        hi = float(np.percentile(M_real[ridx].numpy(), 99.0))
+        cmap, norm, vmin, vmax = "Reds", PowerNorm(gamma=0.5, vmin=0.0, vmax=hi), None, None
+        cbar_label = title_word = "covariance"
 
     fig, axes = plt.subplots(2, n, figsize=(3 * n, 6.4))
     axes = np.atleast_2d(axes)
@@ -312,7 +317,7 @@ def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance
             [(M_real, ridx[col], "real"), (M_gen, gidx[col], "generated")]
         ):
             ax = axes[row, col]
-            im = ax.imshow(M[idx].numpy(), vmin=-vmax, vmax=vmax, cmap="RdBu_r")
+            im = ax.imshow(M[idx].numpy(), cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
             ax.set_xticks([])
             ax.set_yticks([])
             if col == 0:

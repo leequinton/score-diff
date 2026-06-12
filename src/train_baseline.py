@@ -41,10 +41,18 @@ elif SOURCE == "sim":
     # one long, highly autocorrelated path -> bigger train/val gap. cond_sim is the
     # causal trailing market vol from prepare_sim (set cond_dim=0 below to ignore it).
     SUFFIX = "_sim"
-    GAP    = 1000
+    GAP    = 300
     COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", "cond_sim"
 else:
     raise ValueError(f"unknown SOURCE {SOURCE!r}")
+
+# train/val split. "blocked" scatters N_VAL_BLOCKS val blocks across the path with a
+# `gap` embargo each side, so train and val share the same regime mixture -- the right
+# eval for a distributional-fidelity claim (vs "contiguous", which tests regime
+# extrapolation). NOTE the embargo cost: each block discards ~2*GAP steps from train,
+# so with many blocks reduce GAP (ACF-justified) or N_VAL_BLOCKS to avoid starving train.
+SPLIT        = "blocked"
+N_VAL_BLOCKS = 10
 
 TAG       = "_cov" if TARGET == "covariance" else ""
 DATA_FILE = COV_FILE if TARGET == "covariance" else COR_FILE
@@ -83,7 +91,7 @@ CFG = dict(
     n_samples=500,
     eps_t=1e-3,
     seed=42,
-    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
+    cond_dim=0,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
     cond_dropout=0.1,
     guidance_scale=0.0,
 )
@@ -100,6 +108,7 @@ def main(cfg=CFG):
 
     train_ds, val_ds, norm = make_logcov_datasets(
         DATA_PATH, gap=GAP, cond_path=COND_PATH if use_cond else None, target=TARGET,
+        split=SPLIT, n_val_blocks=N_VAL_BLOCKS,
     )
     n_assets = train_ds.X.shape[-1]
     print(f"train: {len(train_ds)}  val: {len(val_ds)}  N={n_assets}  target={TARGET}")
@@ -248,7 +257,7 @@ def main(cfg=CFG):
     C_gen, n_inv = logcov_to_correlation(S_gen)
 
     C_real_all = torch.load(C_PATH, weights_only=True).float()
-    C_real = C_real_all[-len(val_ds):]
+    C_real = C_real_all[val_ds.idx]                    # gather val matrices (split-agnostic)
 
     paths["plot"].parent.mkdir(parents=True, exist_ok=True)
     stats = eval_and_plot(C_real, C_gen, paths["plot"], n_inv_gen=n_inv)
@@ -257,8 +266,8 @@ def main(cfg=CFG):
     if TARGET == "covariance":
         Sigma_gen = logcov_to_covariance(S_gen)
         Cov_all = torch.load(COV_PATH, weights_only=True).float()
-        Cov_real = Cov_all[-len(val_ds):]                 # val split (matches dataset)
-        Cov_train = Cov_all[:len(train_ds)]               # train split (before the gap)
+        Cov_real = Cov_all[val_ds.idx]                    # val split (split-agnostic gather)
+        Cov_train = Cov_all[train_ds.idx]                 # train split
         plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
         stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
         stats.update(gmvp_diagnostics(Cov_real, Sigma_gen))

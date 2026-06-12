@@ -81,8 +81,55 @@ def _logm(M, eig_floor=1e-8):
     return (Q * log_w.unsqueeze(-2)) @ Q.transpose(-1, -2)
 
 
+def _split_indices(T, val_frac, gap, split, n_val_blocks):
+    """Train/val index arrays for either split type.
+
+    "contiguous": train = first (1-val_frac), val = last val_frac, one `gap` seam.
+        On a nonstationary path this puts train and val in different regimes.
+    "blocked": scatter `n_val_blocks` equal val blocks evenly across [0, T) and
+        embargo `gap` steps on each side of every block (removed from train). Both
+        train and val then span the whole timeline, so their marginals match -- the
+        correct setup for a distributional-fidelity claim -- while the embargo keeps
+        every val sample >= gap from any train sample, so val still detects
+        memorisation on the autocorrelated path.
+
+    Returns (train_idx, val_idx) as 1-D long tensors."""
+    if split == "contiguous":
+        n_val = int(T * val_frac)
+        n_train = T - n_val - gap
+        train_idx = torch.arange(n_train)
+        val_idx = torch.arange(n_train + gap, T)
+        return train_idx, val_idx
+
+    if split == "blocked":
+        seg = T / n_val_blocks
+        vbl = max(1, int(T * val_frac / n_val_blocks))     # length of each val block
+        val_mask = torch.zeros(T, dtype=torch.bool)
+        embargo = torch.zeros(T, dtype=torch.bool)          # val blocks + their gap halos
+        for i in range(n_val_blocks):
+            center = int((i + 0.5) * seg)
+            start = max(0, center - vbl // 2)
+            end = min(T, start + vbl)
+            val_mask[start:end] = True
+            embargo[max(0, start - gap):min(T, end + gap)] = True
+        train_idx = torch.nonzero(~embargo, as_tuple=False).squeeze(-1)
+        val_idx = torch.nonzero(val_mask, as_tuple=False).squeeze(-1)
+        # feasibility: each block costs ~(vbl + 2*gap); when n_val_blocks*(vbl+2*gap)
+        # approaches T the embargo zones merge and starve train. Fail loudly instead
+        # of returning a near-empty (or empty) split.
+        if len(train_idx) < len(val_idx) or len(val_idx) < n_val_blocks:
+            raise ValueError(
+                f"blocked split starved: train={len(train_idx)}, val={len(val_idx)} "
+                f"(T={T}, n_val_blocks={n_val_blocks}, gap={gap}, val_block_len={vbl}). "
+                f"Embargo zones ~n_val_blocks*(vbl+2*gap)={n_val_blocks*(vbl+2*gap)} "
+                f"crowd out T={T}; reduce gap or n_val_blocks (need gap << T/(2*n_val_blocks)).")
+        return train_idx, val_idx
+
+    raise ValueError(f"split must be 'contiguous' or 'blocked', got {split!r}")
+
+
 def make_logcov_datasets(C_path, val_frac=0.2, ridge=1e-3, gap=0, cond_path=None,
-                         target="correlation"):
+                         target="correlation", split="contiguous", n_val_blocks=10):
     """Load empirical matrices, take the matrix log, normalize, split. Empirical
     matrices with T_obs ~ N are often near-rank-deficient; a small ridge keeps
     every eigenvalue strictly positive so the matrix log is finite. `target`
@@ -108,12 +155,10 @@ def make_logcov_datasets(C_path, val_frac=0.2, ridge=1e-3, gap=0, cond_path=None
         assert len(cond) == len(S), f"cond length {len(cond)} != S length {len(S)}"
 
     T = S.shape[0]
-    n_val = int(T * val_frac)
-    n_train = T - n_val - gap
-    val_start = n_train + gap
-    S_tr, S_va = S[:n_train], S[val_start:]
-    cond_tr = cond[:n_train] if cond is not None else None
-    cond_va = cond[val_start:] if cond is not None else None
+    train_idx, val_idx = _split_indices(T, val_frac, gap, split, n_val_blocks)
+    S_tr, S_va = S[train_idx], S[val_idx]
+    cond_tr = cond[train_idx] if cond is not None else None
+    cond_va = cond[val_idx] if cond is not None else None
 
     norm = SymNormalizer(S_tr, cond=cond_tr)
     train_ds = MatrixDataset(
@@ -124,4 +169,8 @@ def make_logcov_datasets(C_path, val_frac=0.2, ridge=1e-3, gap=0, cond_path=None
         norm.normalize(S_va),
         cond=(norm.normalize_cond(cond_va) if cond_va is not None else None),
     )
+    # expose the source-tensor indices so the eval can recover the matching raw
+    # covariances/correlations (a tail-slice no longer works once val is scattered).
+    train_ds.idx = train_idx
+    val_ds.idx = val_idx
     return train_ds, val_ds, norm
