@@ -226,15 +226,17 @@ def main(cfg=CFG):
 
     paths["plot"].parent.mkdir(parents=True, exist_ok=True)
     stats = eval_and_plot(C_real, C_gen, paths["plot"], n_inv_gen=n_inv)
-    plot_sample_matrices(C_real, C_gen, paths["samples"])
-    print(f"saved samples -> {paths['samples']}")
 
     # same as train.py only if target set to covariance
     if TARGET == "covariance":
         Sigma_gen = logcov_to_covariance(S_gen)
         Cov_real = torch.load(COV_PATH, weights_only=True).float()[-len(val_ds):]
+        plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
         stats.update(variance_diagnostics(Cov_real, Sigma_gen))
         stats.update(gmvp_diagnostics(Cov_real, Sigma_gen))
+    else:
+        plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
+    print(f"saved samples -> {paths['samples']}")
 
     print(f"saved plot -> {paths['plot']}")
     for k, v in stats.items():

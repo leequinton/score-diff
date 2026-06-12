@@ -268,30 +268,41 @@ def regime_sweep_summary(C_gen_list, cond_values_raw, save_path=None, label=""):
     return rows
 
 
-def plot_sample_matrices(C_real, C_gen, save_path, n=5, seed=0):
+def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance"):
     """Heatmap grid for a quick visual plausibility check: n real (top row) vs n
-    generated (bottom row) correlation matrices on a shared diverging scale [-1, 1].
-    Shows whether generated matrices reproduce block/sector structure, not just
-    aggregate statistics."""
+    generated (bottom row) matrices. Shows whether generated matrices reproduce
+    block/sector structure, not just aggregate statistics.
+
+    kind="correlation" uses the fixed diverging scale [-1, 1]. kind="covariance"
+    derives a shared symmetric scale from a robust (99.5th) percentile of the
+    displayed real entries, so the colour scale is comparable across the two rows
+    and a few large variance diagonals don't wash out the off-diagonal structure
+    (those diagonals saturate, which is fine — they're not the point of the plot)."""
     rng = np.random.default_rng(seed)
-    n = min(n, len(C_real), len(C_gen))
-    ridx = rng.choice(len(C_real), size=n, replace=False)
-    gidx = rng.choice(len(C_gen), size=n, replace=False)
+    n = min(n, len(M_real), len(M_gen))
+    ridx = rng.choice(len(M_real), size=n, replace=False)
+    gidx = rng.choice(len(M_gen), size=n, replace=False)
+
+    if kind == "correlation":
+        vmax, cbar_label, title_word = 1.0, "correlation", "correlation"
+    else:
+        vmax = float(np.percentile(np.abs(M_real[ridx].numpy()), 99.5))
+        cbar_label, title_word = "covariance", "covariance"
 
     fig, axes = plt.subplots(2, n, figsize=(3 * n, 6.4))
     axes = np.atleast_2d(axes)
     for col in range(n):
-        for row, (C, idx, lbl) in enumerate(
-            [(C_real, ridx[col], "real"), (C_gen, gidx[col], "generated")]
+        for row, (M, idx, lbl) in enumerate(
+            [(M_real, ridx[col], "real"), (M_gen, gidx[col], "generated")]
         ):
             ax = axes[row, col]
-            im = ax.imshow(C[idx].numpy(), vmin=-1, vmax=1, cmap="RdBu_r")
+            im = ax.imshow(M[idx].numpy(), vmin=-vmax, vmax=vmax, cmap="RdBu_r")
             ax.set_xticks([])
             ax.set_yticks([])
             if col == 0:
                 ax.set_ylabel(lbl, fontsize=13)
-    fig.suptitle("Sample correlation matrices: real (top) vs generated (bottom)")
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="correlation")
+    fig.suptitle(f"Sample {title_word} matrices: real (top) vs generated (bottom)")
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label=cbar_label)
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 

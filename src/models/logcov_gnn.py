@@ -32,8 +32,8 @@ class LogCovScoreGNN(nn.Module):
         super().__init__()
         self.n_assets = n_assets
         self.cond_dim = cond_dim
-        self.embed = nn.Linear(n_assets, hidden_dim)
-        self.pos = nn.Parameter(torch.randn(n_assets, hidden_dim) * 0.02)
+        self.embed = nn.Linear(n_assets, hidden_dim) # tokenizes matrix row wise
+        self.pos = nn.Parameter(torch.randn(n_assets, hidden_dim) * 0.02) #asset i gets pos[i], under relabeling pos doesn't change with data -> no equivariance
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim),
             nn.Linear(time_dim, hidden_dim),

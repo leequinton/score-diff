@@ -9,6 +9,12 @@ from diagnostics import build_returns, DEFAULT_INDUSTRIES, DEFAULT_FACTORS
 
 # Data loading
 _OUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
+
+# Length of the simulated covariance path. Decoupled from the in-sample length
+# len(v): the DCC parameters are calibrated on history, but the simulated path can
+# run arbitrarily long to give the diffusion model more distinct covariance states
+# (pushing the overfitting threshold out). ~50k x 49 x 49 float64 ~ 1 GB on disk.
+N_SIM_STEPS = 50_000
 df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end="2026-02-27")
 
 # DCC-GARCH Fitting
@@ -145,9 +151,9 @@ if __name__ == "__main__":
     print(f"beta    = {beta:.4f}")
     print(f"loglik  = {-opt.fun * len(v):.1f}   converged={opt.success}")
 
-    print("Simulating from the calibrated DCC-GARCH...")
+    print(f"Simulating {N_SIM_STEPS} steps from the calibrated DCC-GARCH...")
     sim_ret, sim_H, cols = simulate_dcc(results, Qbar, alpha, beta,
-                                        n_steps=len(v), seed=0)
+                                        n_steps=N_SIM_STEPS, seed=0)
     print("sim returns:", sim_ret.shape, " sim cov:", sim_H.shape)
     eigmins = [np.linalg.eigvalsh(sim_H[k])[0] for k in (0, len(sim_H) // 2, -1)]
     print("min eigenvalue across sampled H_t:", float(min(eigmins)))
