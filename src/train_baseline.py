@@ -38,10 +38,11 @@ if SOURCE == "empirical":
     GAP    = 12
     COR_FILE, COV_FILE, COND_FILE = "C_empirical_daily", "Cov_empirical_daily", "cond_daily"
 elif SOURCE == "sim":
-    # one long, highly autocorrelated path -> bigger train/val gap, no conditioning series
+    # one long, highly autocorrelated path -> bigger train/val gap. cond_sim is the
+    # causal trailing market vol from prepare_sim (set cond_dim=0 below to ignore it).
     SUFFIX = "_sim"
     GAP    = 1000
-    COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", None
+    COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", "cond_sim"
 else:
     raise ValueError(f"unknown SOURCE {SOURCE!r}")
 
@@ -82,7 +83,7 @@ CFG = dict(
     n_samples=500,
     eps_t=1e-3,
     seed=42,
-    cond_dim=0,  # [equity vol, rate vol]; set 0 to disable, 1 for equity-only ablation, 2 both
+    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
     cond_dropout=0.1,
     guidance_scale=0.0,
 )
