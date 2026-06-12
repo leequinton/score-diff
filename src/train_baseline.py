@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import math
 import time
 from pathlib import Path
 
@@ -39,7 +40,7 @@ if SOURCE == "empirical":
 elif SOURCE == "sim":
     # one long, highly autocorrelated path -> bigger train/val gap, no conditioning series
     SUFFIX = "_sim"
-    GAP    = 250
+    GAP    = 1000
     COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", None
 else:
     raise ValueError(f"unknown SOURCE {SOURCE!r}")
@@ -70,14 +71,17 @@ CFG = dict(
     batch_size=64,
     lr=2e-4,
     weight_decay=1e-5,
-    n_epochs=50,           # passes over the train set; steps derived from dataset size
-    val_every_epochs=2,    # validate every k epochs
+    lr_schedule="cosine",  # "cosine" (linear warmup -> cosine decay) or "constant"
+    warmup_frac=0.05,      # fraction of total steps spent linearly warming up
+    min_lr_ratio=0.05,     # cosine floor, as a fraction of peak lr
+    n_steps=30_000,        # total optimizer steps (dataset-size-independent; anchors the LR cosine)
+    val_every=1_000,       # validate every k steps
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
     n_samples=500,
     eps_t=1e-3,
-    seed=0,
+    seed=42,
     cond_dim=0,  # [equity vol, rate vol]; set 0 to disable, 1 for equity-only ablation, 2 both
     cond_dropout=0.1,
     guidance_scale=0.0,
@@ -103,14 +107,18 @@ def main(cfg=CFG):
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"])
 
-    # Training schedule is specified in epochs; convert to steps so the amount of
-    # training is invariant to dataset size (sim has ~20x more windows than empirical).
+    # Training schedule is specified directly in optimizer steps so the compute
+    # budget (and the LR cosine horizon) is fixed independent of dataset size T.
+    # That keeps the overfitting study clean: vary T at fixed steps to isolate the
+    # effect of data quantity (per-sample revisits = steps*batch/T) rather than
+    # confounding it with more gradient updates. steps_per_epoch is kept only for
+    # the epoch-denominated log line.
     steps_per_epoch = len(train_loader)
-    n_steps = cfg["n_epochs"] * steps_per_epoch
-    val_every = max(1, round(cfg["val_every_epochs"] * steps_per_epoch))
+    n_steps = cfg["n_steps"]
+    val_every = cfg["val_every"]
     log_every = cfg["log_every"]
-    print(f"epochs: {cfg['n_epochs']}  steps/epoch: {steps_per_epoch}  "
-          f"total steps: {n_steps}  val every: {val_every} steps")
+    print(f"total steps: {n_steps}  steps/epoch: {steps_per_epoch}  "
+          f"(~{n_steps / steps_per_epoch:.1f} epochs)  val every: {val_every} steps")
 
     model = LogCovScoreGNN(
         n_assets=n_assets,
@@ -125,6 +133,21 @@ def main(cfg=CFG):
 
     sde = VPSDE(N=cfg["sde_steps"])
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+
+    # Linear warmup -> cosine decay over the full run (n_steps is known up front).
+    # "constant" leaves lr flat, so the schedule is a clean on/off ablation.
+    warmup_steps = max(1, int(cfg.get("warmup_frac", 0.0) * n_steps))
+    min_ratio = cfg.get("min_lr_ratio", 0.0)
+
+    def lr_lambda(step):
+        if cfg.get("lr_schedule", "constant") != "cosine":
+            return 1.0
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, n_steps - warmup_steps)
+        return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     ema = EMA(model, cfg["ema_decay"])
 
     best_val_loss = float("inf")
@@ -151,6 +174,7 @@ def main(cfg=CFG):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            sched.step()
             ema.update(model)
 
             val_loss_avg = None
@@ -174,6 +198,7 @@ def main(cfg=CFG):
 
             if step % log_every == 0:
                 print(f"epoch {step/steps_per_epoch:5.1f}  step {step:>6d}  "
+                      f"lr {sched.get_last_lr()[0]:.2e}  "
                       f"train_loss {loss.item():.4f}  ({(time.time()-t0)/step:.3f}s/step)")
                 if val_loss_avg is not None:
                     marker = "  **new best**" if step == best_step else ""
