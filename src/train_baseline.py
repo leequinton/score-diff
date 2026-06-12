@@ -255,9 +255,11 @@ def main(cfg=CFG):
     # same as train.py only if target set to covariance
     if TARGET == "covariance":
         Sigma_gen = logcov_to_covariance(S_gen)
-        Cov_real = torch.load(COV_PATH, weights_only=True).float()[-len(val_ds):]
+        Cov_all = torch.load(COV_PATH, weights_only=True).float()
+        Cov_real = Cov_all[-len(val_ds):]                 # val split (matches dataset)
+        Cov_train = Cov_all[:len(train_ds)]               # train split (before the gap)
         plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
-        stats.update(variance_diagnostics(Cov_real, Sigma_gen))
+        stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
         stats.update(gmvp_diagnostics(Cov_real, Sigma_gen))
     else:
         plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")

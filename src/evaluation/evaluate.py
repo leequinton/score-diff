@@ -154,13 +154,17 @@ def cophenetic_per_sample(C, method="average"):
     return out
 
 
-def variance_diagnostics(Sigma_real, Sigma_gen, n_trials=5, seed=0):
+def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, seed=0):
     """Variance-space (scale) fidelity — the dimension that correlation-space
     metrics discard. Wasserstein-1 on the pooled distribution of per-asset
     variances (diagonals of Σ) and on the off-diagonal covariance entries,
-    each against an empirical floor from random halves of the real data.
+    each against an empirical floor from random halves of the real (val) data.
 
-    Sigma_real, Sigma_gen: (T, N, N) covariance batches (not correlation)."""
+    Sigma_real, Sigma_gen: (T, N, N) covariance batches (not correlation).
+    Sigma_train (optional): the train-split covariances. When given, the same
+    variance stats are reported for train, plus gen-vs-train W1 — to disentangle
+    exp-tail reconstruction bias (gen overshoots BOTH train and val) from
+    train/val regime shift (gen tracks train; both differ from val)."""
     var_real = torch.diagonal(Sigma_real, dim1=-2, dim2=-1).flatten().numpy()
     var_gen  = torch.diagonal(Sigma_gen,  dim1=-2, dim2=-1).flatten().numpy()
     covoff_real = _offdiag(Sigma_real).flatten().numpy()
@@ -182,7 +186,7 @@ def variance_diagnostics(Sigma_real, Sigma_gen, n_trials=5, seed=0):
         fc.append(wasserstein_distance(_offdiag(Sa).flatten().numpy(),
                                        _offdiag(Sb).flatten().numpy()))
 
-    return {
+    out = {
         "w1_variance":       w_var,
         "w1_cov_offdiag":    w_cov,
         "floor_w1_variance": float(np.mean(fv)),
@@ -193,6 +197,18 @@ def variance_diagnostics(Sigma_real, Sigma_gen, n_trials=5, seed=0):
         "var_median_real":   float(np.median(var_real)),
         "var_median_gen":    float(np.median(var_gen)),
     }
+
+    if Sigma_train is not None:
+        var_train = torch.diagonal(Sigma_train, dim1=-2, dim2=-1).flatten().numpy()
+        # gen-vs-train W1: if this is ~floor while w1_variance (val) is >>floor,
+        # the scale gap is regime shift, not the model.
+        out.update({
+            "var_mean_train":    float(var_train.mean()),
+            "var_median_train":  float(np.median(var_train)),
+            "w1_variance_train": float(wasserstein_distance(var_train, var_gen)),
+        })
+
+    return out
 
 
 def empirical_floor(C_real, n_trials=5, seed=0):
