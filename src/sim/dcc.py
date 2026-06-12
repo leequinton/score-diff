@@ -9,11 +9,6 @@ from diagnostics import build_returns, DEFAULT_INDUSTRIES, DEFAULT_FACTORS
 
 # Data loading
 _OUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
-
-# Length of the simulated covariance path. Decoupled from the in-sample length
-# len(v): the DCC parameters are calibrated on history, but the simulated path can
-# run arbitrarily long to give the diffusion model more distinct covariance states
-# (pushing the overfitting threshold out). ~50k x 49 x 49 float64 ~ 1 GB on disk.
 N_SIM_STEPS = 50_000
 df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end="2026-02-27")
 

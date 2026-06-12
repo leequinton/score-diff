@@ -7,7 +7,7 @@ from src.models.embeddings import SinusoidalTimeEmbedding, CondEmbedding
 class TransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, dropout=0.0):
         super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
+        self.ln1 = nn.LayerNorm(dim) 
         self.ln2 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
         self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
@@ -45,7 +45,7 @@ class LogCovScoreGNN(nn.Module):
             TransformerBlock(hidden_dim, n_heads, dropout) for _ in range(n_layers)
         )
         self.ln_out = nn.LayerNorm(hidden_dim)
-        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False) # weight matrix for output projection to symmetric matrix: out = h W h^T
 
     def forward(self, x, t, cond=None, cond_mask=None):
         h = self.embed(x) + self.pos
