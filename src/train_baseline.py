@@ -73,7 +73,7 @@ def output_paths(seed):
     )
 
 CFG = dict(
-    hidden_dim=128,
+    hidden_dim=256,
     n_layers=4,
     n_heads=4,
     dropout=0.0,
