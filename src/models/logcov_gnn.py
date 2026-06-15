@@ -41,6 +41,12 @@ class LogCovScoreGNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.cond_embedding = CondEmbedding(cond_dim, hidden_dim) if cond_dim > 0 else None
+        if cond_dim > 0:
+            # zero-init scalar gate per injection point (input + one after each block).
+            # Starts the model as the unconditional one and learns, per point, how much
+            # conditioning to admit (ReZero/LayerScale/adaLN-zero style). The time bias
+            # is NOT gated -- the noise level needs full-strength access at every layer.
+            self.cond_gate = nn.Parameter(torch.zeros(n_layers + 1))
         self.blocks = nn.ModuleList(
             TransformerBlock(hidden_dim, n_heads, dropout) for _ in range(n_layers)
         )
@@ -49,14 +55,23 @@ class LogCovScoreGNN(nn.Module):
 
     def forward(self, x, t, cond=None, cond_mask=None):
         h = self.embed(x) + self.pos
-        t_bias = self.time_mlp(t)[:, None]
+        t_bias = self.time_mlp(t)[:, None]                  # (B, 1, d), full strength every layer
+        cond_bias = None
         if self.cond_embedding is not None:
-            cond_bias = self.cond_embedding(cond, cond_mask=cond_mask, batch_size=x.shape[0])
-            t_bias = t_bias + cond_bias[:, None]
+            cond_bias = self.cond_embedding(cond, cond_mask=cond_mask,
+                                            batch_size=x.shape[0])[:, None]   # (B, 1, d)
+
+        # injection point 0 (input), then one after each block. cond enters through a
+        # zero-init per-point gate, so the model starts unconditional and learns the dose.
         h = h + t_bias
-        for block in self.blocks:
+        if cond_bias is not None:
+            h = h + self.cond_gate[0] * cond_bias
+        for i, block in enumerate(self.blocks, start=1):
             h = block(h)
             h = h + t_bias
+            if cond_bias is not None:
+                h = h + self.cond_gate[i] * cond_bias
+
         h = self.ln_out(h)
         out = h @ self.W(h).transpose(-1, -2)
         return 0.5 * (out + out.transpose(-1, -2))

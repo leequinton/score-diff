@@ -73,8 +73,8 @@ def output_paths(seed):
     )
 
 CFG = dict(
-    hidden_dim=256,
-    n_layers=4,
+    hidden_dim=128,
+    n_layers=5,
     n_heads=4,
     dropout=0.0,
     batch_size=64,
@@ -88,7 +88,7 @@ CFG = dict(
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
-    n_samples=500,
+    n_samples=2000,
     eps_t=1e-3,
     seed=42,
     cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
