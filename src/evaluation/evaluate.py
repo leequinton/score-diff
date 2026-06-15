@@ -1,8 +1,11 @@
 """Compare real vs generated correlation/covariance matrices.
 
-Correlation stylized facts (CorrGAN-style): mean off-diagonal correlation, Gini of
-the eigenvalue spectrum, and cophenetic correlation — each scored by Wasserstein-1
-against an empirical split-half floor. Covariance adds a variance-scale W1."""
+Correlation stylized facts (CorrGAN-style, Marti et al.): mean off-diagonal
+correlation, Gini of the eigenvalue spectrum, cophenetic correlation (single +
+ward linkage), Perron–Frobenius violation (negative mass of the leading
+eigenvector), and the power-law exponent of the eigenvalue distribution — each
+scored by Wasserstein-1 against an empirical split-half floor. Covariance adds a
+variance-scale W1."""
 
 import numpy as np
 import torch
@@ -10,7 +13,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import PowerNorm
 from scipy.stats import wasserstein_distance
 from scipy.cluster.hierarchy import linkage, cophenet
-from scipy.spatial.distance import squareform
 
 
 def _offdiag(M):
@@ -56,14 +58,86 @@ def eig_gini(eigs_desc):
     return 2 * (asc * ranks).sum(-1) / (N * total) - (N + 1) / N
 
 
-def cophenetic_per_sample(C, method="average"):
+def cophenetic_per_sample(C, method="single"):
+    """Cophenetic correlation per matrix using the Mantegna distance
+    d_ij = sqrt(2(1 - C_ij)) on the condensed upper triangle, with `method`
+    linkage ('single' or 'ward'). Higher = stronger hierarchical structure."""
     C_np = C.numpy() if hasattr(C, "numpy") else np.asarray(C)
+    N = C_np.shape[-1]
+    iu = np.triu_indices(N, k=1)
     out = np.empty(C_np.shape[0])
     for i in range(C_np.shape[0]):
-        dist = squareform(np.clip(1.0 - np.abs(C_np[i]), 0.0, 2.0), checks=False)
-        Z = linkage(dist, method=method)
-        out[i], _ = cophenet(Z, dist)
+        d = np.sqrt(np.clip(2.0 * (1.0 - C_np[i]), 0.0, 4.0))[iu]
+        Z = linkage(d, method=method)
+        out[i] = cophenet(Z, d)[0]
     return out
+
+
+def _leading_eigvec_neg_sum(C_np):
+    """Perron–Frobenius violation: -sum of the negative entries of the leading
+    eigenvector (sign-normalised so its entries sum positive). ~0 for a 'clean'
+    correlation matrix whose top eigenvector is all-positive. Returns (T,) >= 0."""
+    out = np.empty(len(C_np))
+    for i in range(len(C_np)):
+        _, V = np.linalg.eigh(C_np[i])      # ascending -> last column = leading
+        v = V[:, -1]
+        if v.sum() < 0:
+            v = -v                          # eigh sign is arbitrary
+        out[i] = -np.minimum(v, 0.0).sum()
+    return out
+
+
+def _powerlaw_alpha(eig_desc):
+    """Power-law exponent alpha of the eigenvalue distribution per matrix
+    (powerlaw.Fit). eig_desc: (T, N) descending. Returns (T,); NaN when the
+    `powerlaw` package is missing, so the rest of the eval still runs."""
+    try:
+        import powerlaw
+    except ImportError:
+        return np.full(eig_desc.shape[0], np.nan)
+    out = np.empty(eig_desc.shape[0])
+    for i in range(eig_desc.shape[0]):
+        ev = eig_desc[i][eig_desc[i] > 1e-12]
+        try:
+            out[i] = powerlaw.Fit(ev, verbose=False).alpha
+        except Exception:
+            out[i] = np.nan
+    return out
+
+
+def _safe_w1(a, b):
+    """Wasserstein-1 that drops NaNs (e.g. powerlaw missing); NaN if a side empties."""
+    a, b = a[~np.isnan(a)], b[~np.isnan(b)]
+    if len(a) == 0 or len(b) == 0:
+        return float("nan")
+    return float(wasserstein_distance(a, b))
+
+
+def _subsample(C, k, seed=0):
+    """At most k rows of C (torch batch), for bounding per-matrix-fact cost."""
+    if len(C) <= k:
+        return C
+    g = torch.Generator().manual_seed(seed)
+    return C[torch.randperm(len(C), generator=g)[:k]]
+
+
+# CorrGAN-style per-matrix stylized facts, computed on <= FACT_SUBSAMPLE matrices
+# (powerlaw.Fit is the bottleneck; 1000 is plenty for stable mean/std/W1).
+FACT_NAMES = ["gini", "coph_single", "coph_ward", "perron", "powerlaw"]
+FACT_SUBSAMPLE = 1000
+
+
+def _per_matrix_facts(C):
+    """Per-matrix stylized facts -> {name: (T,) array} for FACT_NAMES."""
+    C_np = C.numpy() if hasattr(C, "numpy") else np.asarray(C)
+    eig_desc = np.ascontiguousarray(np.sort(np.linalg.eigvalsh(C_np), axis=-1)[:, ::-1])
+    return {
+        "gini":        eig_gini(eig_desc),
+        "coph_single": cophenetic_per_sample(C_np, "single"),
+        "coph_ward":   cophenetic_per_sample(C_np, "ward"),
+        "perron":      _leading_eigvec_neg_sum(C_np),
+        "powerlaw":    _powerlaw_alpha(eig_desc),
+    }
 
 
 def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, seed=0):
@@ -116,7 +190,12 @@ def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, se
 
 
 def empirical_floor(C_real, n_trials=5, seed=0):
-    floors = {"w1_offdiag": [], "w1_gini": [], "w1_coph": []}
+    """Irreducible split-half W1 per stylized fact: how far two halves of the real
+    data sit from each other (the 'indistinguishable' target). Pooled off-diagonal
+    on full halves; per-matrix facts on subsampled halves (powerlaw cost)."""
+    floors = {"w1_offdiag": []}
+    for n in FACT_NAMES:
+        floors[f"w1_{n}"] = []
     half = len(C_real) // 2
     for trial in range(n_trials):
         g = torch.Generator().manual_seed(seed + trial)
@@ -125,15 +204,12 @@ def empirical_floor(C_real, n_trials=5, seed=0):
 
         floors["w1_offdiag"].append(w1_offdiag(Ca, Cb))
 
-        eig_a = np.sort(torch.linalg.eigvalsh(Ca).clamp_min(1e-12).numpy(), axis=-1)[:, ::-1]
-        eig_b = np.sort(torch.linalg.eigvalsh(Cb).clamp_min(1e-12).numpy(), axis=-1)[:, ::-1]
-        gini_a, gini_b = eig_gini(eig_a), eig_gini(eig_b)
-        floors["w1_gini"].append(float(wasserstein_distance(gini_a, gini_b)))
+        fa = _per_matrix_facts(_subsample(Ca, FACT_SUBSAMPLE, seed + trial))
+        fb = _per_matrix_facts(_subsample(Cb, FACT_SUBSAMPLE, seed + trial + 97))
+        for n in FACT_NAMES:
+            floors[f"w1_{n}"].append(_safe_w1(fa[n], fb[n]))
 
-        coph_a, coph_b = cophenetic_per_sample(Ca), cophenetic_per_sample(Cb)
-        floors["w1_coph"].append(float(wasserstein_distance(coph_a, coph_b)))
-
-    return {f"floor_{k}": float(np.mean(v)) for k, v in floors.items()}
+    return {f"floor_{k}": float(np.nanmean(v)) for k, v in floors.items()}
 
 
 def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance"):
@@ -185,63 +261,49 @@ def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
 
     off_real = _offdiag(C_real).flatten().numpy()
     off_gen  = _offdiag(C_gen).flatten().numpy()
+    w_off    = w1_offdiag(C_real, C_gen)
 
-    eig_real_all = np.sort(torch.linalg.eigvalsh(C_real).clamp_min(1e-12).numpy(), axis=-1)[:, ::-1]
-    eig_gen_all  = np.sort(torch.linalg.eigvalsh(C_gen).clamp_min(1e-12).numpy(),  axis=-1)[:, ::-1]
-
-    w_off     = w1_offdiag(C_real, C_gen)
-
-    gini_real = eig_gini(np.ascontiguousarray(eig_real_all))
-    gini_gen  = eig_gini(np.ascontiguousarray(eig_gen_all))
-    w_gini    = float(wasserstein_distance(gini_real, gini_gen))
-
-    coph_real = cophenetic_per_sample(C_real)
-    coph_gen  = cophenetic_per_sample(C_gen)
-    w_coph    = float(wasserstein_distance(coph_real, coph_gen))
-
+    facts_real = _per_matrix_facts(_subsample(C_real, FACT_SUBSAMPLE))
+    facts_gen  = _per_matrix_facts(_subsample(C_gen,  FACT_SUBSAMPLE))
+    w1    = {n: _safe_w1(facts_real[n], facts_gen[n]) for n in FACT_NAMES}
     floor = empirical_floor(C_real)
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    titles = {"gini": "Eigenvalue Gini", "coph_single": "Cophenetic (single)",
+              "coph_ward": "Cophenetic (ward)", "perron": "Perron–Frobenius neg-sum",
+              "powerlaw": "Eigenvalue power-law α"}
+    panels = [("Off-diagonal correlation", off_real, off_gen, w_off,
+               floor["floor_w1_offdiag"], (-1, 1), 80)]
+    for n in FACT_NAMES:
+        a, b = facts_real[n], facts_gen[n]
+        if np.isnan(a).all() or np.isnan(b).all():        # powerlaw pkg missing
+            panels.append((titles[n] + "  (powerlaw missing)", None, None,
+                           float("nan"), floor[f"floor_w1_{n}"], None, None))
+        else:
+            lo, hi = float(min(a.min(), b.min())), float(max(a.max(), b.max()))
+            panels.append((titles[n], a, b, w1[n], floor[f"floor_w1_{n}"],
+                           (lo, hi) if hi > lo else None, 40))
 
-    ax = axes[0]
-    ax.hist(off_real, bins=80, alpha=0.5, density=True, label="real",      range=(-1, 1))
-    ax.hist(off_gen,  bins=80, alpha=0.5, density=True, label="generated", range=(-1, 1))
-    ax.set_title(f"Off-diagonal correlation entries  (W₁={w_off:.4f}, floor={floor['floor_w1_offdiag']:.4f})")
-    ax.set_xlabel("correlation")
-    ax.legend()
-
-    ax = axes[1]
-    g_lo = min(gini_real.min(), gini_gen.min())
-    g_hi = max(gini_real.max(), gini_gen.max())
-    ax.hist(gini_real, bins=40, alpha=0.5, density=True, label="real",      range=(g_lo, g_hi))
-    ax.hist(gini_gen,  bins=40, alpha=0.5, density=True, label="generated", range=(g_lo, g_hi))
-    ax.set_title(f"Eigenvalue Gini coefficient  (W₁={w_gini:.4f}, floor={floor['floor_w1_gini']:.4f})")
-    ax.set_xlabel("Gini")
-    ax.legend()
-
-    ax = axes[2]
-    c_lo = min(coph_real.min(), coph_gen.min())
-    c_hi = max(coph_real.max(), coph_gen.max())
-    ax.hist(coph_real, bins=40, alpha=0.5, density=True, label="real",      range=(c_lo, c_hi))
-    ax.hist(coph_gen,  bins=40, alpha=0.5, density=True, label="generated", range=(c_lo, c_hi))
-    ax.set_title(f"Cophenetic correlation  (W₁={w_coph:.4f}, floor={floor['floor_w1_coph']:.4f})")
-    ax.set_xlabel("cophenetic corr")
-    ax.legend()
-
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    for ax, (title, a, b, wd, fl, rng, bins) in zip(axes.ravel(), panels):
+        if a is None:
+            ax.set_title(title); ax.set_axis_off(); continue
+        ax.hist(a[~np.isnan(a)], bins=bins, alpha=0.5, density=True, label="real",      range=rng)
+        ax.hist(b[~np.isnan(b)], bins=bins, alpha=0.5, density=True, label="generated", range=rng)
+        ax.set_title(f"{title}  (W₁={wd:.4f}, floor={fl:.4f})")
+        ax.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=120)
     plt.close(fig)
 
-    return {
-        "offdiag_mean_real":   float(off_real.mean()),
-        "offdiag_mean_gen":    float(off_gen.mean()),
-        "gini_mean_real":      float(gini_real.mean()),
-        "gini_mean_gen":       float(gini_gen.mean()),
-        "coph_mean_real":      float(coph_real.mean()),
-        "coph_mean_gen":       float(coph_gen.mean()),
-        "w1_offdiag":          w_off,
-        "w1_gini":             w_gini,
-        "w1_coph":             w_coph,
+    stats = {
+        "offdiag_mean_real": float(off_real.mean()),
+        "offdiag_mean_gen":  float(off_gen.mean()),
+        "w1_offdiag":        w_off,
+        "n_invalid_gen":     n_inv_gen,
         **floor,
-        "n_invalid_gen":       n_inv_gen,
     }
+    for n in FACT_NAMES:
+        stats[f"{n}_mean_real"] = float(np.nanmean(facts_real[n]))
+        stats[f"{n}_mean_gen"]  = float(np.nanmean(facts_gen[n]))
+        stats[f"w1_{n}"]        = w1[n]
+    return stats
