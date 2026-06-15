@@ -16,7 +16,7 @@ from src.diffusion.sde import VPSDE
 from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
     logcov_to_correlation, logcov_to_covariance, eval_and_plot,
-    plot_sample_matrices, variance_diagnostics,
+    plot_sample_matrices, variance_diagnostics, regime_binned_eval,
 )
 from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
@@ -279,6 +279,14 @@ def main(cfg=CFG):
         Cov_train = Cov_all[train_ds.idx]                 # train split
         plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
         stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
+
+        # conditional-fidelity eval: bin by trailing-vol regime (raw cond, available
+        # for DM and CDM alike) and compare real vs gen within each bin. CDM feeds the
+        # per-sample cond it was drawn at; DM has none -> its marginal is judged per bin.
+        if COND_PATH is not None:
+            cond_val = torch.load(COND_PATH, weights_only=True).float().reshape(-1)[val_ds.idx]
+            cond_gen = norm.denormalize_cond(sample_cond).reshape(-1).cpu() if use_cond else None
+            stats.update(regime_binned_eval(cond_val, Cov_real, Sigma_gen, cond_gen=cond_gen))
     else:
         plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
     print(f"saved samples -> {paths['samples']}")

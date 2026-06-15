@@ -189,6 +189,73 @@ def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, se
     return out
 
 
+def _np1d(x):
+    if torch.is_tensor(x):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x).reshape(-1)
+
+
+def _corr_offdiag_pooled(Sigma):
+    """Pooled off-diagonal correlations from a covariance batch (scale removed)."""
+    d = torch.diagonal(Sigma, dim1=-2, dim2=-1).clamp_min(1e-12).sqrt()
+    C = (Sigma / (d.unsqueeze(-1) * d.unsqueeze(-2))).clamp(-1.0, 1.0)
+    return _offdiag(C).flatten().numpy()
+
+
+def _var_pooled(Sigma):
+    return torch.diagonal(Sigma, dim1=-2, dim2=-1).flatten().numpy()
+
+
+def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
+                       bin_labels=("lo", "mid", "hi"), n_trials=3, seed=0):
+    """Conditional-fidelity eval. Bin the trailing-vol regime by quantiles of
+    `cond_real`; within each bin compare real vs generated correlation (pooled
+    off-diagonal) and scale (pooled variance) via W1, against a split-half real
+    floor. This is the test conditioning is *for* — the marginal eval averages
+    over regimes and hides it.
+
+    cond_real: (T,) regime value aligned with Sigma_real (the val set, raw space).
+    cond_gen:  (n,) regime value each generated matrix was drawn at (conditional
+               model). If None (unconditional), the whole generated set is compared
+               to every bin -- a marginal generator cannot match per-regime, which
+               is exactly what this surfaces."""
+    cond_real = _np1d(cond_real)
+    edges = np.quantile(cond_real, np.linspace(0, 1, len(bin_labels) + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    cg = _np1d(cond_gen) if cond_gen is not None else None
+
+    out = {}
+    for k, label in enumerate(bin_labels):
+        pre = f"regime_{label}_"
+        rmask = torch.from_numpy((cond_real >= edges[k]) & (cond_real < edges[k + 1]))
+        Sr = _subsample(Sigma_real[rmask], FACT_SUBSAMPLE)
+        if cg is None:
+            Sg = _subsample(Sigma_gen, FACT_SUBSAMPLE)
+        else:
+            gmask = torch.from_numpy((cg >= edges[k]) & (cg < edges[k + 1]))
+            Sg = _subsample(Sigma_gen[gmask], FACT_SUBSAMPLE)
+        out[pre + "n_real"], out[pre + "n_gen"] = float(len(Sr)), float(len(Sg))
+        if len(Sr) < 4 or len(Sg) < 4:
+            for m in ("w1_offdiag", "w1_variance", "floor_w1_offdiag", "floor_w1_variance"):
+                out[pre + m] = float("nan")
+            continue
+
+        out[pre + "w1_offdiag"]  = float(wasserstein_distance(_corr_offdiag_pooled(Sr),
+                                                              _corr_offdiag_pooled(Sg)))
+        out[pre + "w1_variance"] = float(wasserstein_distance(_var_pooled(Sr), _var_pooled(Sg)))
+
+        fo, fv, h = [], [], len(Sr) // 2
+        for t in range(n_trials):
+            g = torch.Generator().manual_seed(seed + t)
+            perm = torch.randperm(len(Sr), generator=g)
+            A, B = Sr[perm[:h]], Sr[perm[h:2 * h]]
+            fo.append(wasserstein_distance(_corr_offdiag_pooled(A), _corr_offdiag_pooled(B)))
+            fv.append(wasserstein_distance(_var_pooled(A), _var_pooled(B)))
+        out[pre + "floor_w1_offdiag"]  = float(np.mean(fo))
+        out[pre + "floor_w1_variance"] = float(np.mean(fv))
+    return out
+
+
 def empirical_floor(C_real, n_trials=5, seed=0):
     """Irreducible split-half W1 per stylized fact: how far two halves of the real
     data sit from each other (the 'indistinguishable' target). Pooled off-diagonal
