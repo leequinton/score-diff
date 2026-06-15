@@ -6,6 +6,7 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -15,8 +16,7 @@ from src.diffusion.sde import VPSDE
 from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
     logcov_to_correlation, logcov_to_covariance, eval_and_plot,
-    plot_sample_matrices, gmvp_diagnostics, regime_sweep_summary,
-    variance_diagnostics,
+    plot_sample_matrices, variance_diagnostics,
 )
 from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
@@ -62,14 +62,15 @@ COV_PATH  = ROOT / "data" / "processed" / f"{COV_FILE}.pt"   # covariance target
 COND_PATH = (ROOT / "data" / "processed" / f"{COND_FILE}.pt") if COND_FILE else None
 
 
-def output_paths(seed):
+def output_paths(seed, cond_dim=0):
+    ctag = "_cond" if cond_dim > 0 else "_uncond"      # keep DM/CDM run outputs separate
+    stem = f"{SUFFIX}{TAG}{ctag}_seed{seed}"
     return dict(
-        ckpt        = ROOT / "checkpoints" / f"logcov_score{SUFFIX}{TAG}_seed{seed}.pt",
-        plot        = ROOT / "results"     / f"real_vs_generated_baseline{SUFFIX}{TAG}_seed{seed}.png",
-        samples     = ROOT / "results"     / f"sample_matrices{SUFFIX}{TAG}_seed{seed}.png",
-        log         = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.csv",
-        loss_plot   = ROOT / "results"     / f"losses_baseline{SUFFIX}{TAG}_seed{seed}.png",
-        regime_plot = ROOT / "results"     / f"regime_sweep_baseline{SUFFIX}{TAG}_seed{seed}.png",
+        ckpt      = ROOT / "checkpoints" / f"logcov_score{stem}.pt",
+        plot      = ROOT / "results"     / f"real_vs_generated_baseline{stem}.png",
+        samples   = ROOT / "results"     / f"sample_matrices{stem}.png",
+        log       = ROOT / "results"     / f"losses_baseline{stem}.csv",
+        loss_plot = ROOT / "results"     / f"losses_baseline{stem}.png",
     )
 
 CFG = dict(
@@ -96,14 +97,22 @@ CFG = dict(
     guidance_scale=0.0,
 )
 
+# multi-seed sweep: run every (variant, seed) and report mean +- std across seeds.
+# DM = unconditional, CDM = conditional (the reference paper's two columns).
+SEEDS = (0, 1, 2)
+VARIANTS = {
+    "DM":  {"cond_dim": 0},
+    "CDM": {"cond_dim": 1},
+}
+
 
 def main(cfg=CFG):
     seed = cfg["seed"]
-    paths = output_paths(seed)
-    torch.manual_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     cond_dim = cfg.get("cond_dim", 0)
     use_cond = cond_dim > 0
+    paths = output_paths(seed, cond_dim)
+    torch.manual_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}  seed: {seed}  cond_dim: {cond_dim}")
 
     train_ds, val_ds, norm = make_logcov_datasets(
@@ -270,7 +279,6 @@ def main(cfg=CFG):
         Cov_train = Cov_all[train_ds.idx]                 # train split
         plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
         stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
-        stats.update(gmvp_diagnostics(Cov_real, Sigma_gen))
     else:
         plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
     print(f"saved samples -> {paths['samples']}")
@@ -279,33 +287,51 @@ def main(cfg=CFG):
     for k, v in stats.items():
         print(f"  {k:>22s}: {v:.4f}")
 
-    if use_cond:
-        print()
-        sweep_levels_norm = [-1.28, 0.0, 1.28]
-        sweep_n = max(64, cfg["n_samples"] // 4)
-        C_gen_list, cond_raw_list = [], []
-        with ema.swap_in(model):
-            model.eval()
-            for c_norm in sweep_levels_norm:
-                c_tensor = torch.full((sweep_n, cond_dim), c_norm, device=device)
-                S_g = sample_logcov(model, sde, sweep_n, n_assets,
-                                    device=device, eps_t=cfg["eps_t"],
-                                    cond=c_tensor, guidance_scale=0.0)
-                C_, _ = logcov_to_correlation(norm.denormalize(S_g).cpu())
-                c_raw = norm.denormalize_cond(c_tensor[:1])[0, 0].item()
-                C_gen_list.append(C_)
-                cond_raw_list.append(c_raw)
-        sweep_rows = regime_sweep_summary(C_gen_list, cond_raw_list,
-                                          save_path=paths["regime_plot"],
-                                          label="(baseline, w=0)")
-        print(f"saved regime sweep -> {paths['regime_plot']}")
-        print("regime sweep (matched cond → output stats):")
-        for r in sweep_rows:
-            print(f"  cond={r['cond']:6.2f}  mean_offdiag={r['mean_offdiag']:6.4f}  "
-                  f"top_eig={r['top_eig']:6.4f}  n_valid={r['n_valid']}")
-
     return {**stats, "best_val_loss": best_val_loss, "best_step": best_step}
 
 
+def aggregate_runs(runs):
+    """runs: list of per-seed stats dicts. -> {metric: (mean, std)} over the seeds,
+    for the metrics present in every run."""
+    if not runs:
+        return {}
+    keys = set(runs[0]).intersection(*[set(r) for r in runs[1:]])
+    return {k: (float(np.mean([r[k] for r in runs])),
+               float(np.std([r[k] for r in runs]))) for k in sorted(keys)}
+
+
+def run_experiments(seeds=SEEDS, variants=VARIANTS):
+    """Run every (variant, seed) combination and write a mean +- std table across
+    seeds, one column per variant -- the DM (unconditional) vs CDM (conditional)
+    comparison. `variants` maps a column label to a cfg override (e.g. cond_dim)."""
+    agg = {}
+    for label, override in variants.items():
+        runs = []
+        for seed in seeds:
+            print(f"\n===== variant={label}  seed={seed} =====")
+            runs.append(main({**CFG, "seed": seed, **override}))
+        agg[label] = aggregate_runs(runs)
+
+    metrics = sorted(set().union(*[set(a) for a in agg.values()]))
+    out = ROOT / "results" / f"summary{SUFFIX}{TAG}.csv"
+    with out.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric"] + [f"{lbl}_mean" for lbl in agg] + [f"{lbl}_std" for lbl in agg])
+        for m in metrics:
+            row = [m]
+            row += [f"{agg[lbl].get(m, (float('nan'),))[0]:.6f}" for lbl in agg]
+            row += [f"{agg[lbl].get(m, (float('nan'), float('nan')))[1]:.6f}" for lbl in agg]
+            w.writerow(row)
+    print(f"\nsaved summary table -> {out}")
+    print(f"{'metric':>22s} | " + " | ".join(f"{lbl:^22s}" for lbl in agg))
+    for m in metrics:
+        cells = []
+        for lbl in agg:
+            mean, std = agg[lbl].get(m, (float("nan"), float("nan")))
+            cells.append(f"{mean:9.4f} ± {std:7.4f}")
+        print(f"{m:>22s} | " + " | ".join(cells))
+    return agg
+
+
 if __name__ == "__main__":
-    main()
+    run_experiments()
