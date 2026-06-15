@@ -89,7 +89,9 @@ CFG = dict(
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
-    n_samples=1000,
+    n_samples=3000,        # ~1000 per regime bin (3 bins) so the per-regime W1 isn't
+                           #   sample-starved; with the FACT_SUBSAMPLE=1000 cap this also
+                           #   matches DM/CDM per-bin counts (both cap to 1000)
     eps_t=1e-3,
     seed=42,
     cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
@@ -247,9 +249,20 @@ def main(cfg=CFG):
 
     sample_cond = None
     if use_cond:
-        val_cond = val_ds.cond.to(device)
-        n_rep = (cfg["n_samples"] + len(val_cond) - 1) // len(val_cond)
-        sample_cond = val_cond.repeat(n_rep, 1)[:cfg["n_samples"]]
+        # Draw a REPRESENTATIVE sample of the val regime distribution. (The old
+        # val_cond[:n_samples] took the first matrices in time order -> one early
+        # block, skewing the conditioning toward whatever regime that slice is in.)
+        # A fixed generator keeps the conditioning identical across seeds, so the
+        # per-regime numbers reflect model variance, not cond-draw variance.
+        val_cond = val_ds.cond
+        n = cfg["n_samples"]
+        if n <= len(val_cond):
+            g = torch.Generator().manual_seed(0)
+            sel = torch.randperm(len(val_cond), generator=g)[:n]
+            sample_cond = val_cond[sel].to(device)
+        else:
+            n_rep = (n + len(val_cond) - 1) // len(val_cond)
+            sample_cond = val_cond.repeat(n_rep, 1)[:n].to(device)
 
     print(f"sampling {cfg['n_samples']} matrices "
           f"(cond={'matched-val' if use_cond else 'unconditional'}, "
