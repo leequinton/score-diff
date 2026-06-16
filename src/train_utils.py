@@ -10,6 +10,7 @@ class EMA:
     def __init__(self, model, decay):
         self.decay = decay
         self.shadow = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        self.backup = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
 
     def update(self, model):
         for n, p in model.named_parameters():
@@ -18,16 +19,16 @@ class EMA:
 
     @contextlib.contextmanager
     def swap_in(self, model):
-        backup = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
         for n, p in model.named_parameters():
             if p.requires_grad:
+                self.backup[n].copy_(p.data)
                 p.data.copy_(self.shadow[n])
         try:
             yield
         finally:
             for n, p in model.named_parameters():
                 if p.requires_grad:
-                    p.data.copy_(backup[n])
+                    p.data.copy_(self.backup[n])
 
 
 def cycle(loader):

@@ -4,6 +4,8 @@ import contextlib
 import csv
 import math
 import time
+import gc
+import random
 from pathlib import Path
 
 import numpy as np
@@ -110,10 +112,14 @@ VARIANTS = {
 
 def main(cfg=CFG):
     seed = cfg["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     cond_dim = cfg.get("cond_dim", 0)
     use_cond = cond_dim > 0
     paths = output_paths(seed, cond_dim)
-    torch.manual_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}  seed: {seed}  cond_dim: {cond_dim}")
 
@@ -173,7 +179,7 @@ def main(cfg=CFG):
 
     best_val_loss = float("inf")
     best_step = 0
-    best_ema_shadow = None
+    best_ema_shadow = None      # set to a clone of ema.shadow each time val improves
 
     paths["log"].parent.mkdir(parents=True, exist_ok=True)
     with paths["log"].open("w", newline="") as log_file:
@@ -312,6 +318,10 @@ def main(cfg=CFG):
     print(f"saved plot -> {paths['plot']}")
     for k, v in stats.items():
         print(f"  {k:>22s}: {v:.4f}")
+
+    del model, sde, opt, ema, train_loader, val_loader, train_ds, val_ds  # free GPU memory
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return {**stats, "best_val_loss": best_val_loss, "best_step": best_step}
 
