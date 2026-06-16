@@ -42,8 +42,11 @@ if SOURCE == "empirical":
 elif SOURCE == "sim":
     # one long, highly autocorrelated path -> bigger train/val gap. cond_sim is the
     # causal trailing market vol from prepare_sim (set cond_dim=0 below to ignore it).
+    # GAP=500 exceeds the path's empirical decorrelation length: the ACF of realized
+    # variance / top eigenvalue falls below 0.05 by ~460 steps, so a 500-step embargo
+    # makes train and val effectively independent at each block seam (300 left ~0.2).
     SUFFIX = "_sim"
-    GAP    = 300
+    GAP    = 500
     COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", "cond_sim"
 else:
     raise ValueError(f"unknown SOURCE {SOURCE!r}")
@@ -91,12 +94,10 @@ CFG = dict(
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
-    n_samples=3000,        # ~1000 per regime bin (3 bins) so the per-regime W1 isn't
-                           #   sample-starved; with the FACT_SUBSAMPLE=1000 cap this also
-                           #   matches DM/CDM per-bin counts (both cap to 1000)
+    n_samples=3000,        # ~1000 per regime bin (3 bins)
     eps_t=1e-3,
     seed=42,
-    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 0 disables
+    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 
     cond_dropout=0.1,
     guidance_scale=0.0,
 )
