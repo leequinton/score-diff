@@ -75,7 +75,7 @@ def output_paths(seed, cond_dim=0):
 
 CFG = dict(
     hidden_dim=128,
-    n_layers=5,
+    n_layers=4,
     n_heads=4,
     dropout=0.0,
     batch_size=64,
@@ -101,7 +101,7 @@ CFG = dict(
 
 # multi-seed sweep: run every (variant, seed) and report mean +- std across seeds.
 # DM = unconditional, CDM = conditional (the reference paper's two columns).
-SEEDS = (0, 1, 2)
+SEEDS = (0, 1, 2, 3, 4)
 VARIANTS = {
     "DM":  {"cond_dim": 0},
     "CDM": {"cond_dim": 1},
@@ -236,6 +236,11 @@ def main(cfg=CFG):
         print(f"using best EMA from step {best_step}  (val_loss {best_val_loss:.4f})")
     else:
         print("No best val recorded, using final step weights")
+
+    if use_cond and model.cond_embedding is not None:
+        gate = ema.shadow["cond_gate"].detach().cpu()
+        print(f"cond_gate (ema) per injection point: {gate.numpy().round(4)}")
+        print(f"cond_gate (ema) abs-mean: {gate.abs().mean().item():.4f}")  # to see whether conditioning gate is precedent
 
     paths["ckpt"].parent.mkdir(parents=True, exist_ok=True)
     torch.save({

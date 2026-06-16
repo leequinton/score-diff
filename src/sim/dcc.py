@@ -14,7 +14,7 @@ df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end=
 
 # DCC-GARCH Fitting
 
-# Part (1) univariate fitting to each series
+# Univariate fitting to each series
 # AR(1)-GARCH(1,1) with Student's t innovations
 def fit_univariate(df, const_mean=("Guns",)):
     Z, results = {}, {}
@@ -29,7 +29,7 @@ def fit_univariate(df, const_mean=("Guns",)):
     return pd.DataFrame(Z).dropna(), results
 
 
-# Part (2) DCC fitting to standardized resduals obtained
+# DCC fitting to standardized resduals obtained
 # Constant Conditional Correlation Estimate
 def constant_corr(Z):
     v = Z.values

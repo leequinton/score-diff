@@ -207,43 +207,65 @@ def _var_pooled(Sigma):
 
 
 def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
-                       bin_labels=("lo", "mid", "hi"), n_trials=3, seed=0):
+                       bin_labels=("lo", "mid", "hi"), n_trials=10, seed=0):
     """Conditional-fidelity eval. Bin the trailing-vol regime by quantiles of
     `cond_real`; within each bin compare real vs generated correlation (pooled
     off-diagonal) and scale (pooled variance) via W1, against a split-half real
-    floor. This is the test conditioning is *for* — the marginal eval averages
+    floor. This is the test conditioning is *for* -- the marginal eval averages
     over regimes and hides it.
 
     cond_real: (T,) regime value aligned with Sigma_real (the val set, raw space).
     cond_gen:  (n,) regime value each generated matrix was drawn at (conditional
                model). If None (unconditional), the whole generated set is compared
                to every bin -- a marginal generator cannot match per-regime, which
-               is exactly what this surfaces."""
+               is exactly what this surfaces.
+
+    Notes on the comparison being made (state these in the paper):
+      * CDM (cond_gen given): bin-vs-bin -- generated-conditioned-on-bin-k vs
+        real-in-bin-k. This is conditional fidelity.
+      * DM (cond_gen None): full-marginal-vs-bin -- the *entire* generated set vs
+        real-in-bin-k. This is the right baseline (a regime-blind model judged
+        against each regime), NOT "DM restricted to bin k". The DM per-bin W1 is
+        therefore a marginal-vs-conditional distance, by construction >= a model
+        that tracks the regime.
+      * floor: split-half of the *real* in-bin matrices -- the irreducible
+        sampling distance, the 'indistinguishable' target for that bin.
+      * regime_pooled_*: the no-binning row (all real vs all gen), computed by the
+        SAME machinery as the bins (same FACT_SUBSAMPLE, same n_trials floor) so it
+        sits apples-to-apples atop the lo/mid/hi rows -- 'overall' vs per-regime.
+
+    `n_trials` defaults to 10 (was 3): the in-bin variance floor is the noisiest
+    quantity and it is the denominator for the headline 'x floor' ratios, so it
+    needs more split-half repeats to be stable.
+    """
     cond_real = _np1d(cond_real)
     edges = np.quantile(cond_real, np.linspace(0, 1, len(bin_labels) + 1))
     edges[0], edges[-1] = -np.inf, np.inf
     cg = _np1d(cond_gen) if cond_gen is not None else None
 
-    out = {}
-    for k, label in enumerate(bin_labels):
-        pre = f"regime_{label}_"
-        rmask = torch.from_numpy((cond_real >= edges[k]) & (cond_real < edges[k + 1]))
-        Sr = _subsample(Sigma_real[rmask], FACT_SUBSAMPLE)
-        if cg is None:
-            Sg = _subsample(Sigma_gen, FACT_SUBSAMPLE)
-        else:
-            gmask = torch.from_numpy((cg >= edges[k]) & (cg < edges[k + 1]))
-            Sg = _subsample(Sigma_gen[gmask], FACT_SUBSAMPLE)
-        out[pre + "n_real"], out[pre + "n_gen"] = float(len(Sr)), float(len(Sg))
+    def block(Sr_full, Sg_full, pre):
+        """One real-vs-gen comparison (W1 + split-half floor + ratios). Shared by
+        the pooled row and every regime bin so they are computed identically."""
+        Sr = _subsample(Sr_full, FACT_SUBSAMPLE)
+        # degenerate (non-positive diagonal) gen count -- 0 for expm covariances,
+        # but surfaced so a high-vol-bin sample-dropping bias would be visible.
+        d = torch.diagonal(Sg_full, dim1=-2, dim2=-1)
+        n_invalid = int((~(d > 1e-6).all(dim=-1)).sum().item())
+        Sg = _subsample(Sg_full, FACT_SUBSAMPLE)
+        res = {pre + "n_real": float(len(Sr)), pre + "n_gen": float(len(Sg)),
+               pre + "n_invalid_gen": float(n_invalid)}
         if len(Sr) < 4 or len(Sg) < 4:
-            for m in ("w1_offdiag", "w1_variance", "floor_w1_offdiag", "floor_w1_variance"):
-                out[pre + m] = float("nan")
-            continue
+            for m in ("w1_offdiag", "w1_variance", "floor_w1_offdiag",
+                      "floor_w1_variance", "w1_offdiag_over_floor", "w1_variance_over_floor"):
+                res[pre + m] = float("nan")
+            return res
 
-        out[pre + "w1_offdiag"]  = float(wasserstein_distance(_corr_offdiag_pooled(Sr),
-                                                              _corr_offdiag_pooled(Sg)))
-        out[pre + "w1_variance"] = float(wasserstein_distance(_var_pooled(Sr), _var_pooled(Sg)))
+        res[pre + "w1_offdiag"] = float(wasserstein_distance(
+            _corr_offdiag_pooled(Sr), _corr_offdiag_pooled(Sg)))
+        res[pre + "w1_variance"] = float(wasserstein_distance(
+            _var_pooled(Sr), _var_pooled(Sg)))
 
+        # split-half floor (real vs real), averaged over n_trials
         fo, fv, h = [], [], len(Sr) // 2
         for t in range(n_trials):
             g = torch.Generator().manual_seed(seed + t)
@@ -251,8 +273,30 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
             A, B = Sr[perm[:h]], Sr[perm[h:2 * h]]
             fo.append(wasserstein_distance(_corr_offdiag_pooled(A), _corr_offdiag_pooled(B)))
             fv.append(wasserstein_distance(_var_pooled(A), _var_pooled(B)))
-        out[pre + "floor_w1_offdiag"]  = float(np.mean(fo))
-        out[pre + "floor_w1_variance"] = float(np.mean(fv))
+        res[pre + "floor_w1_offdiag"] = float(np.mean(fo))
+        res[pre + "floor_w1_variance"] = float(np.mean(fv))
+
+        # ratios to floor (the headline 'x floor'); guard a zero/near-zero floor
+        res[pre + "w1_offdiag_over_floor"] = float(
+            res[pre + "w1_offdiag"] / res[pre + "floor_w1_offdiag"]) \
+            if res[pre + "floor_w1_offdiag"] > 1e-12 else float("nan")
+        res[pre + "w1_variance_over_floor"] = float(
+            res[pre + "w1_variance"] / res[pre + "floor_w1_variance"]) \
+            if res[pre + "floor_w1_variance"] > 1e-12 else float("nan")
+        return res
+
+    out = {}
+    # pooled row: no binning, all real vs all gen, identical machinery to the bins.
+    out.update(block(Sigma_real, Sigma_gen, "regime_pooled_"))
+    for k, label in enumerate(bin_labels):
+        rmask = torch.from_numpy((cond_real >= edges[k]) & (cond_real < edges[k + 1]))
+        if cg is None:
+            Sg_full = Sigma_gen
+        else:
+            gmask = torch.from_numpy((cg >= edges[k]) & (cg < edges[k + 1]))
+            Sg_full = Sigma_gen[gmask]
+        out.update(block(Sigma_real[rmask], Sg_full, f"regime_{label}_"))
+
     return out
 
 
@@ -336,7 +380,7 @@ def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
     floor = empirical_floor(C_real)
 
     titles = {"gini": "Eigenvalue Gini", "coph_single": "Cophenetic (single)",
-              "coph_ward": "Cophenetic (ward)", "perron": "Perron–Frobenius neg-sum",
+              "coph_ward": "Cophenetic (ward)", "perron": "Perron-Frobenius neg-sum",
               "powerlaw": "Eigenvalue power-law α"}
     panels = [("Off-diagonal correlation", off_real, off_gen, w_off,
                floor["floor_w1_offdiag"], (-1, 1), 80)]
