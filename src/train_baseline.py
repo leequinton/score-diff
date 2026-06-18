@@ -311,7 +311,8 @@ def main(cfg=CFG):
         Cov_all = torch.load(COV_PATH, weights_only=True).float()
         Cov_real = Cov_all[val_ds.idx]                    # val split (split-agnostic gather)
         Cov_train = Cov_all[train_ds.idx]                 # train split
-        plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], kind="covariance")
+        # covariance + correlation of the same sampled matrices (model emits both)
+        plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], show_cov=True)
         stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
 
         # conditional-fidelity eval: bin by trailing-vol regime (raw cond, available
@@ -322,7 +323,7 @@ def main(cfg=CFG):
             cond_gen = norm.denormalize_cond(sample_cond).reshape(-1).cpu() if use_cond else None
             stats.update(regime_binned_eval(cond_val, Cov_real, Sigma_gen, cond_gen=cond_gen))
     else:
-        plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
+        plot_sample_matrices(C_real, C_gen, paths["samples"], show_cov=False)
     print(f"saved samples -> {paths['samples']}")
 
     print(f"saved plot -> {paths['plot']}")

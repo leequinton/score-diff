@@ -15,7 +15,7 @@ N_SIM_STEPS = 50_000
 # repeats identical fits -- instead we fit once and simulate each seed. Seed 0 keeps
 # the canonical sim_cov.npy / sim_returns.npy used for training+val; seeds >= 1 write
 # sim_cov_seed{k}.npy oracle paths (independent draws of the same calibrated law).
-ORACLE_SEEDS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+SEEDS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end="2026-02-27")
 
 # DCC-GARCH Fitting
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     print(f"beta    = {beta:.4f}")
     print(f"loglik  = {-opt.fun * len(v):.1f}   converged={opt.success}")
 
-    for k in ORACLE_SEEDS:
+    for k in SEEDS:
         print(f"Simulating {N_SIM_STEPS} steps from the calibrated DCC-GARCH (seed {k})...")
         sim_ret, sim_H, cols = simulate_dcc(results, Qbar, alpha, beta,
                                             n_steps=N_SIM_STEPS, seed=k)

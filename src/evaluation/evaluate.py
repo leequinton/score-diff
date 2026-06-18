@@ -317,45 +317,67 @@ def rolling_lw_covariances(returns, idx, window):
     return torch.from_numpy(out).float(), keep
 
 
-def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance"):
-    """Heatmap grid for a quick visual plausibility check: n real (top row) vs n
-    generated (bottom row) matrices. Shows whether generated matrices reproduce
-    block/sector structure, not just aggregate statistics.
+def _normalize_cov_np(M):
+    """Batch of covariances (k, N, N) -> correlations, in numpy."""
+    d = np.sqrt(np.clip(np.diagonal(M, axis1=-2, axis2=-1), 1e-12, None))
+    return np.clip(M / (d[:, :, None] * d[:, None, :]), -1.0, 1.0)
 
-    kind="correlation" uses the fixed diverging scale [-1, 1] (correlations are
-    genuinely signed). kind="covariance" uses a *sequential* 0->vmax scale with
-    gamma compression: covariance entries are almost all positive, so a symmetric
-    diverging map wastes half its range and renders the bulk as washed-out pale
-    pink. PowerNorm(gamma<1) expands the low end so the off-diagonal structure
-    shows, while the high-variance entries saturate (vmax = robust 99th percentile
-    of the displayed real matrices, shared across both rows for comparability)."""
+
+def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
+    """Heatmap grid (viridis) for a visual plausibility check: n real vs n generated
+    matrices, showing whether generated matrices reproduce block/sector structure.
+
+    With `show_cov` (the covariance target), `real`/`gen` are covariance batches and
+    the figure has FOUR row-blocks -- covariance (real, gen) then the correlation of
+    the SAME sampled matrices (real, gen) -- since the model produces both at once,
+    so you see each matrix on both scales. Otherwise `real`/`gen` are correlations
+    and only the two correlation blocks are drawn.
+
+    Covariance rows use a *sequential* 0->vmax scale with gamma compression:
+    covariance entries are almost all positive, so a symmetric diverging map wastes
+    half its range; PowerNorm(gamma<1) expands the low end so off-diagonal structure
+    shows while high-variance entries saturate (vmax = robust 99th percentile of the
+    displayed real covariances). Correlation rows use a fixed [-1, 1] linear scale."""
     rng = np.random.default_rng(seed)
-    n = min(n, len(M_real), len(M_gen))
-    ridx = rng.choice(len(M_real), size=n, replace=False)
-    gidx = rng.choice(len(M_gen), size=n, replace=False)
+    n = min(n, len(real), len(gen))
+    ridx = rng.choice(len(real), size=n, replace=False)
+    gidx = rng.choice(len(gen), size=n, replace=False)
+    real_s = (real.numpy() if hasattr(real, "numpy") else np.asarray(real))[ridx]
+    gen_s  = (gen.numpy()  if hasattr(gen,  "numpy") else np.asarray(gen))[gidx]
 
-    if kind == "correlation":
-        cmap, norm, vmin, vmax = "RdBu_r", None, -1.0, 1.0
-        cbar_label = title_word = "correlation"
+    if show_cov:
+        blocks = [("covariance\n(real)", "cov", real_s),
+                  ("covariance\n(generated)", "cov", gen_s),
+                  ("correlation\n(real)", "corr", _normalize_cov_np(real_s)),
+                  ("correlation\n(generated)", "corr", _normalize_cov_np(gen_s))]
+        cov_norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=float(np.percentile(real_s, 99.0)))
     else:
-        hi = float(np.percentile(M_real[ridx].numpy(), 99.0))
-        cmap, norm, vmin, vmax = "Reds", PowerNorm(gamma=0.5, vmin=0.0, vmax=hi), None, None
-        cbar_label = title_word = "covariance"
+        blocks = [("correlation\n(real)", "corr", real_s),
+                  ("correlation\n(generated)", "corr", gen_s)]
+        cov_norm = None
 
-    fig, axes = plt.subplots(2, n, figsize=(3 * n, 6.4))
+    nrows = len(blocks)
+    fig, axes = plt.subplots(nrows, n, figsize=(3 * n + 1, 3 * nrows))
     axes = np.atleast_2d(axes)
-    for col in range(n):
-        for row, (M, idx, lbl) in enumerate(
-            [(M_real, ridx[col], "real"), (M_gen, gidx[col], "generated")]
-        ):
-            ax = axes[row, col]
-            im = ax.imshow(M[idx].numpy(), cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if col == 0:
-                ax.set_ylabel(lbl, fontsize=13)
-    fig.suptitle(f"Sample {title_word} matrices: real (top) vs generated (bottom)")
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label=cbar_label)
+    im_cov = im_corr = None
+    for r, (label, kind, data) in enumerate(blocks):
+        for c in range(n):
+            ax = axes[r, c]
+            if kind == "cov":
+                im_cov = ax.imshow(data[c], cmap="viridis", norm=cov_norm)
+            else:
+                im_corr = ax.imshow(data[c], cmap="viridis", vmin=-1.0, vmax=1.0)
+            ax.set_xticks([]); ax.set_yticks([])
+            if c == 0:
+                ax.set_ylabel(label, fontsize=11)
+
+    # one colorbar per scale, each spanning its own row-blocks
+    if im_cov is not None:
+        cov_axes = [axes[r, c] for r in range(nrows) if blocks[r][1] == "cov" for c in range(n)]
+        fig.colorbar(im_cov, ax=cov_axes, shrink=0.6, label="covariance")
+    corr_axes = [axes[r, c] for r in range(nrows) if blocks[r][1] == "corr" for c in range(n)]
+    fig.colorbar(im_corr, ax=corr_axes, shrink=0.6, label="correlation")
+    fig.suptitle("Sample matrices: real vs generated")
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
