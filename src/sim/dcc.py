@@ -10,6 +10,12 @@ from diagnostics import build_returns, DEFAULT_INDUSTRIES, DEFAULT_FACTORS
 # Data loading
 _OUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
 N_SIM_STEPS = 50_000
+# Independent DGP realizations for the distributional-fidelity "True" row. The DCC
+# fit is deterministic in the FF data, so re-running the whole script per seed only
+# repeats identical fits -- instead we fit once and simulate each seed. Seed 0 keeps
+# the canonical sim_cov.npy / sim_returns.npy used for training+val; seeds >= 1 write
+# sim_cov_seed{k}.npy oracle paths (independent draws of the same calibrated law).
+ORACLE_SEEDS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end="2026-02-27")
 
 # DCC-GARCH Fitting
@@ -146,12 +152,14 @@ if __name__ == "__main__":
     print(f"beta    = {beta:.4f}")
     print(f"loglik  = {-opt.fun * len(v):.1f}   converged={opt.success}")
 
-    print(f"Simulating {N_SIM_STEPS} steps from the calibrated DCC-GARCH...")
-    sim_ret, sim_H, cols = simulate_dcc(results, Qbar, alpha, beta,
-                                        n_steps=N_SIM_STEPS, seed=0)
-    print("sim returns:", sim_ret.shape, " sim cov:", sim_H.shape)
-    eigmins = [np.linalg.eigvalsh(sim_H[k])[0] for k in (0, len(sim_H) // 2, -1)]
-    print("min eigenvalue across sampled H_t:", float(min(eigmins)))
-    np.save(os.path.join(_OUT_DIR, "sim_cov.npy"), sim_H)
-    np.save(os.path.join(_OUT_DIR, "sim_returns.npy"), sim_ret)
-    print("saved sim_cov.npy and sim_returns.npy")
+    for k in ORACLE_SEEDS:
+        print(f"Simulating {N_SIM_STEPS} steps from the calibrated DCC-GARCH (seed {k})...")
+        sim_ret, sim_H, cols = simulate_dcc(results, Qbar, alpha, beta,
+                                            n_steps=N_SIM_STEPS, seed=k)
+        eigmins = [np.linalg.eigvalsh(sim_H[i])[0] for i in (0, len(sim_H) // 2, -1)]
+        print(f"  sim cov: {sim_H.shape}  min eigenvalue across sampled H_t: {float(min(eigmins)):.3e}")
+        # seed 0 -> canonical training/val path; seeds >= 1 -> oracle draws.
+        suffix = "" if k == 0 else f"_seed{k}"
+        np.save(os.path.join(_OUT_DIR, f"sim_cov{suffix}.npy"), sim_H)
+        np.save(os.path.join(_OUT_DIR, f"sim_returns{suffix}.npy"), sim_ret)
+        print(f"  saved sim_cov{suffix}.npy and sim_returns{suffix}.npy")

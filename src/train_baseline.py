@@ -19,6 +19,7 @@ from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
     logcov_to_correlation, logcov_to_covariance, eval_and_plot,
     plot_sample_matrices, variance_diagnostics, regime_binned_eval,
+    w1_facts, to_correlation, rolling_lw_covariances, _subsample,
 )
 from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
@@ -103,12 +104,20 @@ CFG = dict(
 )
 
 # multi-seed sweep: run every (variant, seed) and report mean +- std across seeds.
-# DM = unconditional, CDM = conditional (the reference paper's two columns).
+# SGM  = unconditional score-based generative model (no regime conditioning).
+# SGCM = conditional score-based generative model (trailing-vol conditioning).
 SEEDS = (0, 1, 2, 3, 4)
 VARIANTS = {
-    "DM":  {"cond_dim": 0},
-    "CDM": {"cond_dim": 1},
+    "SGM":  {"cond_dim": 0},
+    "SGCM": {"cond_dim": 1},
 }
+
+# Ledoit-Wolf baseline: trailing window (steps) for the rolling OOS covariance
+# estimate, and the number of bootstrap-resample repeats used to give the LW row a
+# W1 band comparable to the other columns. 252 ~ one trading year; window/N ~ 5 at
+# N=49, a realistic estimation horizon rather than a rigged one.
+LW_WINDOW = 252
+LW_TRIALS = 10
 
 
 def main(cfg=CFG):
@@ -337,10 +346,174 @@ def aggregate_runs(runs):
                float(np.std([r[k] for r in runs]))) for k in sorted(keys)}
 
 
+def _bootstrap(C, seed):
+    """Resample a matrix batch with replacement to its own size (for the LW band)."""
+    g = torch.Generator().manual_seed(seed)
+    return C[torch.randint(len(C), (len(C),), generator=g)]
+
+
+def distributional_fidelity_baselines(cfg=CFG):
+    """Model-independent rows of the distributional-fidelity table, scored against
+    the SAME fixed val reference as SGM/SGCM:
+      * True -- independent DGP draws (data/sim_cov_seed*.npy from dcc.py). Each
+        path is an i.i.d. realization of the calibrated law, so W1(draw, val) is the
+        irreducible floor; reported mean +- std over the K paths (between-draw var).
+      * LW   -- rolling Ledoit-Wolf covariance on the OOS returns at the val
+        indices; mean +- std over LW_TRIALS bootstrap resamples (W1 sampling noise).
+    Returns {label: {metric: (mean, std)}} for the labels that are computable."""
+    if TARGET != "covariance":
+        print("[dist-fidelity] baselines need TARGET='covariance'; skipping")
+        return {}
+    _, val_ds, _ = make_logcov_datasets(
+        DATA_PATH, gap=GAP, cond_path=None, target=TARGET,
+        split=SPLIT, n_val_blocks=N_VAL_BLOCKS,
+    )
+    Cov_real = torch.load(COV_PATH, weights_only=True).float()[val_ds.idx]
+    C_real = torch.load(C_PATH, weights_only=True).float()[val_ds.idx]
+    n = cfg["n_samples"]
+    out = {}
+
+    # --- True (DGP oracle): independent re-simulated H_t paths -----------------
+    oracle_paths = sorted((ROOT / "data").glob("sim_cov_seed*.npy"))
+    runs = []
+    for p in oracle_paths:
+        H = torch.from_numpy(np.load(p)).float()
+        H = 0.5 * (H + H.transpose(-1, -2))            # enforce symmetry (fp drift)
+        Sig = _subsample(H, n)                          # match the generated sample size
+        C, _ = to_correlation(Sig)
+        runs.append(w1_facts(C_real, C, Sigma_real=Cov_real, Sigma_gen=Sig))
+    if runs:
+        out["True"] = aggregate_runs(runs)
+        print(f"[dist-fidelity] True row from {len(runs)} oracle path(s)")
+    else:
+        print("[dist-fidelity] no oracle paths (data/sim_cov_seed*.npy) -- run dcc.py "
+              "with ORACLE_SEEDS to populate the True row; skipping it for now")
+
+    # --- LW baseline: rolling Ledoit-Wolf at the val indices -------------------
+    returns = np.load(ROOT / "data" / "sim_returns.npy")
+    lw_cov, keep = rolling_lw_covariances(returns, val_ds.idx.numpy(), LW_WINDOW)
+    var_real = torch.diagonal(Cov_real, dim1=-2, dim2=-1).flatten()  # val ref (constant)
+    runs = []
+    for t in range(LW_TRIALS):
+        Sig = _bootstrap(lw_cov, t)
+        C, _ = to_correlation(Sig)
+        r = w1_facts(C_real, C, Sigma_real=Cov_real, Sigma_gen=Sig)
+        v = torch.diagonal(Sig, dim1=-2, dim2=-1).flatten()
+        # variance levels so the LW column of the scale table is self-contained
+        r.update(var_mean_gen=float(v.mean()), var_median_gen=float(v.median()),
+                 var_mean_real=float(var_real.mean()), var_median_real=float(var_real.median()))
+        runs.append(r)
+    out["LW"] = aggregate_runs(runs)
+    print(f"[dist-fidelity] LW row from {len(lw_cov)} trailing-window estimates "
+          f"(window={LW_WINDOW}, {len(val_ds.idx) - len(keep)} early val idx dropped)")
+    return out
+
+
+def _fmt_cell(d):
+    """(mean, std) -> 'mean ± std', or blank for a missing/None cell."""
+    if d is None:
+        return f"{'':^16s}"
+    return f"{d[0]:8.4f} ± {d[1]:6.4f}"
+
+
+def _write_csv(path, head_label, head_cols, rows):
+    """rows: list of (label, [cell_or_None per head_col]); each cell (mean,std)."""
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([head_label] + [f"{c}_mean" for c in head_cols] + [f"{c}_std" for c in head_cols])
+        for label, cells in rows:
+            w.writerow([label]
+                       + ["" if c is None else f"{c[0]:.6f}" for c in cells]
+                       + ["" if c is None else f"{c[1]:.6f}" for c in cells])
+
+
+def _print_table(head_label, head_cols, rows):
+    print(f"{head_label:>24s} | " + " | ".join(f"{c:^16s}" for c in head_cols))
+    for label, cells in rows:
+        print(f"{label:>24s} | " + " | ".join(_fmt_cell(c) for c in cells))
+
+
+# --- Table 1: stylized facts (W1 to val), True / SGM / SGCM / LW ---------------
+FACTS_ROWS = [
+    ("w1_offdiag",     "off-diagonal correlation"),
+    ("w1_gini",        "eigenvalue Gini"),
+    ("w1_coph_single", "cophenetic (single)"),
+    ("w1_coph_ward",   "cophenetic (ward)"),
+    ("w1_perron",      "Perron-Frobenius"),
+    ("w1_powerlaw",    "eigenvalue power-law"),
+]
+
+
+def write_facts_table(agg):
+    """Table 1 -- stylized-fact W1 to the val reference, one column per model.
+    Read SGM/SGCM against True (the floor they should approach) and LW (baseline)."""
+    cols = [c for c in ("True", "SGM", "SGCM", "LW") if c in agg]
+    rows = [(label, [agg[c].get(key) for c in cols]) for key, label in FACTS_ROWS]
+    out = ROOT / "results" / f"facts{SUFFIX}{TAG}.csv"
+    _write_csv(out, "stylized_fact", cols, rows)
+    print(f"\n[Table 1] stylized facts (W1 to val) -> {out}")
+    _print_table("stylized fact", cols, rows)
+
+
+# --- Table 2: regime-specific W1, SGM vs SGCM ----------------------------------
+REGIME_BINS = [("regime_pooled_", "pooled"), ("regime_lo_", "lo"),
+               ("regime_mid_", "mid"), ("regime_hi_", "hi")]
+
+
+def write_regime_table(agg):
+    """Table 2 -- per-regime W1 (off-diag + variance) for SGM vs SGCM. SGM is the
+    regime-blind marginal-vs-bin baseline; SGCM the conditional bin-vs-bin."""
+    models = [c for c in ("SGM", "SGCM") if c in agg]
+    if not models:
+        return
+    cols = [(f"{mdl} {mlbl}", mdl, suf)
+            for suf, mlbl in (("w1_offdiag", "offdiag"), ("w1_variance", "var"))
+            for mdl in models]
+    headers = [h for h, _, _ in cols]
+    rows = [(blabel, [agg[m].get(pre + suf) for _, m, suf in cols])
+            for pre, blabel in REGIME_BINS]
+    out = ROOT / "results" / f"regime{SUFFIX}{TAG}.csv"
+    _write_csv(out, "regime", headers, rows)
+    print(f"\n[Table 2] regime-specific W1 -> {out}")
+    _print_table("regime", headers, rows)
+
+
+# --- Table 3: variance / scale (real vs generated) -----------------------------
+VAR_ROWS = [("mean variance", "mean"), ("median variance", "median"),
+            ("W1 variance (to val)", "w1")]
+
+
+def write_variance_table(agg):
+    """Table 3 -- pooled per-asset variance: real-vs-generated levels (mean,
+    median) and W1-to-val. No True column: the DGP oracle's scale is the real law
+    by construction, so the meaningful comparison is real vs each generator."""
+    model_cols = [c for c in ("SGM", "SGCM", "LW") if c in agg]
+    ref = next((agg[c] for c in model_cols if "var_mean_real" in agg[c]), None)
+    if ref is None:
+        return
+    cols = ["real"] + model_cols
+
+    def cell(col, kind):
+        if col == "real":
+            return None if kind == "w1" else ref.get(f"var_{kind}_real")
+        if kind == "w1":
+            return agg[col].get("w1_variance")
+        return agg[col].get(f"var_{kind}_gen")
+
+    rows = [(label, [cell(c, kind) for c in cols]) for label, kind in VAR_ROWS]
+    out = ROOT / "results" / f"variance{SUFFIX}{TAG}.csv"
+    _write_csv(out, "metric", cols, rows)
+    print(f"\n[Table 3] variance / scale (real vs generated) -> {out}")
+    _print_table("metric", cols, rows)
+
+
 def run_experiments(seeds=SEEDS, variants=VARIANTS):
-    """Run every (variant, seed) combination and write a mean +- std table across
-    seeds, one column per variant -- the DM (unconditional) vs CDM (conditional)
-    comparison. `variants` maps a column label to a cfg override (e.g. cond_dim)."""
+    """Run every (variant, seed) combination, then assemble the part-1 result
+    tables. Model columns (SGM unconditional vs SGCM conditional) are aggregated
+    mean +- std across seeds; the model-independent True (DGP oracle) and LW
+    baseline columns come from distributional_fidelity_baselines(). Writes the full
+    per-metric model summary plus three focused tables: (1) stylized facts, (2)
+    regime-specific W1, (3) variance/scale."""
     agg = {}
     for label, override in variants.items():
         runs = []
@@ -349,6 +522,8 @@ def run_experiments(seeds=SEEDS, variants=VARIANTS):
             runs.append(main({**CFG, "seed": seed, **override}))
         agg[label] = aggregate_runs(runs)
 
+    # full per-metric model summary (SGM/SGCM only -- the baselines carry W1 facts
+    # only, so folding them into this dump would be mostly NaN).
     metrics = sorted(set().union(*[set(a) for a in agg.values()]))
     out = ROOT / "results" / f"summary{SUFFIX}{TAG}.csv"
     with out.open("w", newline="") as f:
@@ -367,6 +542,12 @@ def run_experiments(seeds=SEEDS, variants=VARIANTS):
             mean, std = agg[lbl].get(m, (float("nan"), float("nan")))
             cells.append(f"{mean:9.4f} ± {std:7.4f}")
         print(f"{m:>22s} | " + " | ".join(cells))
+
+    # part-1 result tables: add True + LW columns, then write the three focused tables.
+    agg.update(distributional_fidelity_baselines())
+    write_facts_table(agg)       # Table 1: stylized facts (W1 to val)
+    write_regime_table(agg)      # Table 2: regime-specific W1 (SGM vs SGCM)
+    write_variance_table(agg)    # Table 3: variance / scale (real vs generated)
     return agg
 
 

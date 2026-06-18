@@ -4,8 +4,9 @@ Correlation stylized facts (CorrGAN-style, Marti et al.): mean off-diagonal
 correlation, Gini of the eigenvalue spectrum, cophenetic correlation (single +
 ward linkage), Perron–Frobenius violation (negative mass of the leading
 eigenvector), and the power-law exponent of the eigenvalue distribution — each
-scored by Wasserstein-1 against an empirical split-half floor. Covariance adds a
-variance-scale W1."""
+scored by Wasserstein-1 against a fixed real (val) reference. Covariance adds a
+variance-scale W1. The irreducible floor is no longer a split-half of the val set:
+it is the True (DGP oracle) row of the distributional-fidelity table."""
 
 import numpy as np
 import torch
@@ -140,10 +141,11 @@ def _per_matrix_facts(C):
     }
 
 
-def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, seed=0):
+def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None):
     """Variance-space (scale) fidelity — the dimension correlation metrics discard.
-    Wasserstein-1 on the pooled distribution of per-asset variances (diagonals of Σ)
-    against an empirical floor from random halves of the real (val) data.
+    Wasserstein-1 on the pooled distribution of per-asset variances (diagonals of Σ).
+    The irreducible floor lives in the True (DGP oracle) row of the distributional-
+    fidelity table, so this no longer computes a split-half floor.
 
     Sigma_real, Sigma_gen: (T, N, N) covariance batches (not correlation).
     Sigma_train (optional): the train-split covariances. When given, the same
@@ -153,27 +155,13 @@ def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None, n_trials=5, se
     var_real = torch.diagonal(Sigma_real, dim1=-2, dim2=-1).flatten().numpy()
     var_gen  = torch.diagonal(Sigma_gen,  dim1=-2, dim2=-1).flatten().numpy()
 
-    w_var = float(wasserstein_distance(var_real, var_gen))
-
-    # floor from random halves of the real covariances
-    fv = []
-    half = len(Sigma_real) // 2
-    for trial in range(n_trials):
-        g = torch.Generator().manual_seed(seed + trial)
-        perm = torch.randperm(len(Sigma_real), generator=g)
-        Sa, Sb = Sigma_real[perm[:half]], Sigma_real[perm[half:half * 2]]
-        fv.append(wasserstein_distance(
-            torch.diagonal(Sa, dim1=-2, dim2=-1).flatten().numpy(),
-            torch.diagonal(Sb, dim1=-2, dim2=-1).flatten().numpy()))
-
     out = {
-        "w1_variance":       w_var,
-        "floor_w1_variance": float(np.mean(fv)),
-        "var_mean_real":     float(var_real.mean()),
-        "var_mean_gen":      float(var_gen.mean()),
+        "w1_variance":     float(wasserstein_distance(var_real, var_gen)),
+        "var_mean_real":   float(var_real.mean()),
+        "var_mean_gen":    float(var_gen.mean()),
         # median is robust to the exp() tail of log-variance reconstruction
-        "var_median_real":   float(np.median(var_real)),
-        "var_median_gen":    float(np.median(var_gen)),
+        "var_median_real": float(np.median(var_real)),
+        "var_median_gen":  float(np.median(var_gen)),
     }
 
     if Sigma_train is not None:
@@ -207,12 +195,11 @@ def _var_pooled(Sigma):
 
 
 def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
-                       bin_labels=("lo", "mid", "hi"), n_trials=10, seed=0):
+                       bin_labels=("lo", "mid", "hi")):
     """Conditional-fidelity eval. Bin the trailing-vol regime by quantiles of
     `cond_real`; within each bin compare real vs generated correlation (pooled
-    off-diagonal) and scale (pooled variance) via W1, against a split-half real
-    floor. This is the test conditioning is *for* -- the marginal eval averages
-    over regimes and hides it.
+    off-diagonal) and scale (pooled variance) via W1. This is the test conditioning
+    is *for* -- the marginal eval averages over regimes and hides it.
 
     cond_real: (T,) regime value aligned with Sigma_real (the val set, raw space).
     cond_gen:  (n,) regime value each generated matrix was drawn at (conditional
@@ -228,15 +215,12 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
         against each regime), NOT "DM restricted to bin k". The DM per-bin W1 is
         therefore a marginal-vs-conditional distance, by construction >= a model
         that tracks the regime.
-      * floor: split-half of the *real* in-bin matrices -- the irreducible
-        sampling distance, the 'indistinguishable' target for that bin.
       * regime_pooled_*: the no-binning row (all real vs all gen), computed by the
-        SAME machinery as the bins (same FACT_SUBSAMPLE, same n_trials floor) so it
-        sits apples-to-apples atop the lo/mid/hi rows -- 'overall' vs per-regime.
+        SAME machinery as the bins so it sits apples-to-apples atop the lo/mid/hi
+        rows -- 'overall' vs per-regime.
 
-    `n_trials` defaults to 10 (was 3): the in-bin variance floor is the noisiest
-    quantity and it is the denominator for the headline 'x floor' ratios, so it
-    needs more split-half repeats to be stable.
+    No floor is computed here: the split-half floor was dropped in favour of the
+    True (DGP oracle) row of the distributional-fidelity table.
     """
     cond_real = _np1d(cond_real)
     edges = np.quantile(cond_real, np.linspace(0, 1, len(bin_labels) + 1))
@@ -244,8 +228,7 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
     cg = _np1d(cond_gen) if cond_gen is not None else None
 
     def block(Sr_full, Sg_full, pre):
-        """One real-vs-gen comparison (W1 + split-half floor + ratios). Shared by
-        the pooled row and every regime bin so they are computed identically."""
+        """One real-vs-gen W1 comparison, shared by the pooled row and every bin."""
         Sr = _subsample(Sr_full, FACT_SUBSAMPLE)
         # degenerate (non-positive diagonal) gen count -- 0 for expm covariances,
         # but surfaced so a high-vol-bin sample-dropping bias would be visible.
@@ -255,34 +238,13 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
         res = {pre + "n_real": float(len(Sr)), pre + "n_gen": float(len(Sg)),
                pre + "n_invalid_gen": float(n_invalid)}
         if len(Sr) < 4 or len(Sg) < 4:
-            for m in ("w1_offdiag", "w1_variance", "floor_w1_offdiag",
-                      "floor_w1_variance", "w1_offdiag_over_floor", "w1_variance_over_floor"):
-                res[pre + m] = float("nan")
+            res[pre + "w1_offdiag"] = res[pre + "w1_variance"] = float("nan")
             return res
 
         res[pre + "w1_offdiag"] = float(wasserstein_distance(
             _corr_offdiag_pooled(Sr), _corr_offdiag_pooled(Sg)))
         res[pre + "w1_variance"] = float(wasserstein_distance(
             _var_pooled(Sr), _var_pooled(Sg)))
-
-        # split-half floor (real vs real), averaged over n_trials
-        fo, fv, h = [], [], len(Sr) // 2
-        for t in range(n_trials):
-            g = torch.Generator().manual_seed(seed + t)
-            perm = torch.randperm(len(Sr), generator=g)
-            A, B = Sr[perm[:h]], Sr[perm[h:2 * h]]
-            fo.append(wasserstein_distance(_corr_offdiag_pooled(A), _corr_offdiag_pooled(B)))
-            fv.append(wasserstein_distance(_var_pooled(A), _var_pooled(B)))
-        res[pre + "floor_w1_offdiag"] = float(np.mean(fo))
-        res[pre + "floor_w1_variance"] = float(np.mean(fv))
-
-        # ratios to floor (the headline 'x floor'); guard a zero/near-zero floor
-        res[pre + "w1_offdiag_over_floor"] = float(
-            res[pre + "w1_offdiag"] / res[pre + "floor_w1_offdiag"]) \
-            if res[pre + "floor_w1_offdiag"] > 1e-12 else float("nan")
-        res[pre + "w1_variance_over_floor"] = float(
-            res[pre + "w1_variance"] / res[pre + "floor_w1_variance"]) \
-            if res[pre + "floor_w1_variance"] > 1e-12 else float("nan")
         return res
 
     out = {}
@@ -300,27 +262,59 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
     return out
 
 
-def empirical_floor(C_real, n_trials=5, seed=0):
-    """Irreducible split-half W1 per stylized fact: how far two halves of the real
-    data sit from each other (the 'indistinguishable' target). Pooled off-diagonal
-    on full halves; per-matrix facts on subsampled halves (powerlaw cost)."""
-    floors = {"w1_offdiag": []}
+def w1_facts(C_real, C_gen, Sigma_real=None, Sigma_gen=None):
+    """Per-stylized-fact W1 of `gen` against a FIXED `real` reference, no floor.
+    The single-number-per-fact scorer shared by every row of the distributional-
+    fidelity table (True / SGM / SGCM / LW) so all four are computed identically.
+
+    C_real, C_gen: correlation batches (T, N, N) for the correlation facts.
+    Sigma_real, Sigma_gen: optional covariance batches; when both given, adds the
+    pooled per-asset variance W1 (the scale dimension the correlation facts drop).
+    """
+    fr = _per_matrix_facts(_subsample(C_real, FACT_SUBSAMPLE))
+    fg = _per_matrix_facts(_subsample(C_gen, FACT_SUBSAMPLE))
+    out = {"w1_offdiag": w1_offdiag(C_real, C_gen)}
     for n in FACT_NAMES:
-        floors[f"w1_{n}"] = []
-    half = len(C_real) // 2
-    for trial in range(n_trials):
-        g = torch.Generator().manual_seed(seed + trial)
-        perm = torch.randperm(len(C_real), generator=g)
-        Ca, Cb = C_real[perm[:half]], C_real[perm[half:half * 2]]
+        out[f"w1_{n}"] = _safe_w1(fr[n], fg[n])
+    if Sigma_real is not None and Sigma_gen is not None:
+        out["w1_variance"] = float(wasserstein_distance(
+            _var_pooled(Sigma_real), _var_pooled(Sigma_gen)))
+    return out
 
-        floors["w1_offdiag"].append(w1_offdiag(Ca, Cb))
 
-        fa = _per_matrix_facts(_subsample(Ca, FACT_SUBSAMPLE, seed + trial))
-        fb = _per_matrix_facts(_subsample(Cb, FACT_SUBSAMPLE, seed + trial + 97))
-        for n in FACT_NAMES:
-            floors[f"w1_{n}"].append(_safe_w1(fa[n], fb[n]))
+def ledoit_wolf(X):
+    """Ledoit-Wolf (2004) scaled-identity shrinkage covariance from observations
+    X (n_obs, N). Shrinks the sample covariance S toward mu*I (mu = mean variance)
+    by the optimal intensity that minimises expected Frobenius loss. The shrinkage
+    constant uses the closed-form b^2 = (sum_t ||x_t||^4 - n||S||^2)/(n^2 N), which
+    is the vectorised identity for (1/n^2) sum_t ||x_t x_t^T - S||_F^2 -- so there
+    is no per-observation loop."""
+    X = np.asarray(X, dtype=np.float64)
+    n, N = X.shape
+    X = X - X.mean(0, keepdims=True)
+    S = (X.T @ X) / n
+    mu = np.trace(S) / N
+    s2 = float(np.sum(S * S))                       # ||S||_F^2
+    d2 = (s2 - np.trace(S) ** 2 / N) / N            # ||S - mu I||_F^2 / N
+    b2 = (np.sum((X * X).sum(1) ** 2) - n * s2) / (n * n * N)
+    b2 = min(b2, d2)                                # b^2 <= d^2 by construction
+    shrink = 0.0 if d2 <= 0 else b2 / d2
+    return shrink * mu * np.eye(N) + (1.0 - shrink) * S
 
-    return {f"floor_{k}": float(np.nanmean(v)) for k, v in floors.items()}
+
+def rolling_lw_covariances(returns, idx, window):
+    """Strictly-causal trailing Ledoit-Wolf covariance at each index in `idx`.
+    For each t in idx with a full trailing window, estimate LW cov from
+    returns[t-window:t] (excludes t, so it is causal and never sees H_t). Indices
+    with t < window are dropped. returns: (T, N); idx: 1-D int array.
+    -> (m, N, N) float32 covariance tensor, plus the kept indices."""
+    returns = np.asarray(returns)
+    idx = np.asarray(idx)
+    keep = idx[idx >= window]
+    out = np.empty((len(keep), returns.shape[1], returns.shape[1]))
+    for j, t in enumerate(keep):
+        out[j] = ledoit_wolf(returns[t - window:t])
+    return torch.from_numpy(out).float(), keep
 
 
 def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance"):
@@ -367,6 +361,9 @@ def plot_sample_matrices(M_real, M_gen, save_path, n=5, seed=0, kind="covariance
 
 
 def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
+    """Per-run diagnostic plot + marginal W1 stats (gen vs the val reference). The
+    irreducible floor is no longer computed here -- it lives in the True (DGP
+    oracle) row of the distributional-fidelity table."""
     if n_inv_gen:
         print(f"  [eval] {n_inv_gen} generated samples were dropped (degenerate)")
 
@@ -377,30 +374,28 @@ def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
     facts_real = _per_matrix_facts(_subsample(C_real, FACT_SUBSAMPLE))
     facts_gen  = _per_matrix_facts(_subsample(C_gen,  FACT_SUBSAMPLE))
     w1    = {n: _safe_w1(facts_real[n], facts_gen[n]) for n in FACT_NAMES}
-    floor = empirical_floor(C_real)
 
     titles = {"gini": "Eigenvalue Gini", "coph_single": "Cophenetic (single)",
               "coph_ward": "Cophenetic (ward)", "perron": "Perron-Frobenius neg-sum",
               "powerlaw": "Eigenvalue power-law α"}
-    panels = [("Off-diagonal correlation", off_real, off_gen, w_off,
-               floor["floor_w1_offdiag"], (-1, 1), 80)]
+    panels = [("Off-diagonal correlation", off_real, off_gen, w_off, (-1, 1), 80)]
     for n in FACT_NAMES:
         a, b = facts_real[n], facts_gen[n]
         if np.isnan(a).all() or np.isnan(b).all():        # powerlaw pkg missing
             panels.append((titles[n] + "  (powerlaw missing)", None, None,
-                           float("nan"), floor[f"floor_w1_{n}"], None, None))
+                           float("nan"), None, None))
         else:
             lo, hi = float(min(a.min(), b.min())), float(max(a.max(), b.max()))
-            panels.append((titles[n], a, b, w1[n], floor[f"floor_w1_{n}"],
+            panels.append((titles[n], a, b, w1[n],
                            (lo, hi) if hi > lo else None, 40))
 
     fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-    for ax, (title, a, b, wd, fl, rng, bins) in zip(axes.ravel(), panels):
+    for ax, (title, a, b, wd, rng, bins) in zip(axes.ravel(), panels):
         if a is None:
             ax.set_title(title); ax.set_axis_off(); continue
         ax.hist(a[~np.isnan(a)], bins=bins, alpha=0.5, density=True, label="real",      range=rng)
         ax.hist(b[~np.isnan(b)], bins=bins, alpha=0.5, density=True, label="generated", range=rng)
-        ax.set_title(f"{title}  (W₁={wd:.4f}, floor={fl:.4f})")
+        ax.set_title(f"{title}  (W₁={wd:.4f})")
         ax.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=120)
@@ -411,7 +406,6 @@ def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
         "offdiag_mean_gen":  float(off_gen.mean()),
         "w1_offdiag":        w_off,
         "n_invalid_gen":     n_inv_gen,
-        **floor,
     }
     for n in FACT_NAMES:
         stats[f"{n}_mean_real"] = float(np.nanmean(facts_real[n]))
