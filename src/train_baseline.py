@@ -323,7 +323,7 @@ def main(cfg=CFG):
             cond_gen = norm.denormalize_cond(sample_cond).reshape(-1).cpu() if use_cond else None
             stats.update(regime_binned_eval(cond_val, Cov_real, Sigma_gen, cond_gen=cond_gen))
     else:
-        plot_sample_matrices(C_real, C_gen, paths["samples"], show_cov=False)
+        plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
     print(f"saved samples -> {paths['samples']}")
 
     print(f"saved plot -> {paths['plot']}")
@@ -408,6 +408,44 @@ def distributional_fidelity_baselines(cfg=CFG):
     print(f"[dist-fidelity] LW row from {len(lw_cov)} trailing-window estimates "
           f"(window={LW_WINDOW}, {len(val_ds.idx) - len(keep)} early val idx dropped)")
     return out
+
+
+def check_true_variance(cfg=CFG):
+    """TEMP diagnostic (no training): does the DGP oracle ALSO overshoot val in
+    scale? If so, val is a low-variance finite draw rather than the model being
+    biased. Prints the True (oracle) variance W1 to val and the val/train/oracle
+    variance levels. Reads only the oracle .npy paths and the val split, so it runs
+    independently of any model. On Colab:
+
+        python -c "import src.train_baseline as t; t.check_true_variance()"
+    """
+    from scipy.stats import wasserstein_distance
+    from src.data.dataset import _split_indices
+
+    Cov_all = torch.load(COV_PATH, weights_only=True).float()
+    train_idx, val_idx = _split_indices(len(Cov_all), 0.2, GAP, SPLIT, N_VAL_BLOCKS)
+    diag = lambda S: torch.diagonal(S, dim1=-2, dim2=-1).flatten().numpy()
+    var_val, var_train = diag(Cov_all[val_idx]), diag(Cov_all[train_idx])
+    n = cfg["n_samples"]
+
+    oracle_paths = sorted((ROOT / "data").glob("sim_cov_seed*.npy"))
+    if not oracle_paths:
+        print("[true-var] no oracle paths (data/sim_cov_seed*.npy); run dcc.py first")
+        return
+    w1s, means, medians = [], [], []
+    for p in oracle_paths:
+        H = torch.from_numpy(np.load(p)).float()
+        H = 0.5 * (H + H.transpose(-1, -2))
+        v = diag(_subsample(H, n))                      # match the generated sample size
+        w1s.append(float(wasserstein_distance(var_val, v)))
+        means.append(float(v.mean())); medians.append(float(np.median(v)))
+
+    print(f"[true-var] oracle paths: {len(oracle_paths)}   n_subsample={n}")
+    print(f"  val     mean={var_val.mean():.3f}  median={np.median(var_val):.3f}")
+    print(f"  train   mean={var_train.mean():.3f}  median={np.median(var_train):.3f}")
+    print(f"  oracle  mean={np.mean(means):.3f}  median={np.mean(medians):.3f}")
+    print(f"  TRUE w1_variance (oracle vs val) = {np.mean(w1s):.4f} +/- {np.std(w1s):.4f}")
+    print(f"  reference (your run): SGM 0.389  SGCM 0.440  LW 0.177")
 
 
 def _fmt_cell(d):
