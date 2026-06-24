@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import csv
 import math
 import time
@@ -19,7 +18,7 @@ from src.diffusion.solver import sample_logcov
 from src.evaluation.evaluate import (
     logcov_to_correlation, logcov_to_covariance, eval_and_plot,
     plot_sample_matrices, variance_diagnostics, regime_binned_eval,
-    w1_facts, to_correlation, rolling_lw_covariances, _subsample,
+    fact_means, to_correlation, rolling_lw_covariances,
 )
 from src.models.logcov_gnn import LogCovScoreGNN
 from src.train_utils import EMA, cycle, plot_losses
@@ -113,11 +112,9 @@ VARIANTS = {
 }
 
 # Ledoit-Wolf baseline: trailing window (steps) for the rolling OOS covariance
-# estimate, and the number of bootstrap-resample repeats used to give the LW row a
-# W1 band comparable to the other columns. 252 ~ one trading year; window/N ~ 5 at
-# N=49, a realistic estimation horizon rather than a rigged one.
+# estimate. 252 ~ one trading year; window/N ~ 5 at N=49, a realistic estimation
+# horizon rather than a rigged one.
 LW_WINDOW = 252
-LW_TRIALS = 10
 
 
 def main(cfg=CFG):
@@ -323,7 +320,7 @@ def main(cfg=CFG):
             cond_gen = norm.denormalize_cond(sample_cond).reshape(-1).cpu() if use_cond else None
             stats.update(regime_binned_eval(cond_val, Cov_real, Sigma_gen, cond_gen=cond_gen))
     else:
-        plot_sample_matrices(C_real, C_gen, paths["samples"], kind="correlation")
+        plot_sample_matrices(C_real, C_gen, paths["samples"], show_cov=False)
     print(f"saved samples -> {paths['samples']}")
 
     print(f"saved plot -> {paths['plot']}")
@@ -347,105 +344,58 @@ def aggregate_runs(runs):
                float(np.std([r[k] for r in runs]))) for k in sorted(keys)}
 
 
-def _bootstrap(C, seed):
-    """Resample a matrix batch with replacement to its own size (for the LW band)."""
-    g = torch.Generator().manual_seed(seed)
-    return C[torch.randint(len(C), (len(C),), generator=g)]
-
-
 def distributional_fidelity_baselines(cfg=CFG):
-    """Model-independent rows of the distributional-fidelity table, scored against
-    the SAME fixed val reference as SGM/SGCM:
-      * True -- independent DGP draws (data/sim_cov_seed*.npy from dcc.py). Each
-        path is an i.i.d. realization of the calibrated law, so W1(draw, val) is the
-        irreducible floor; reported mean +- std over the K paths (between-draw var).
-      * LW   -- rolling Ledoit-Wolf covariance on the OOS returns at the val
-        indices; mean +- std over LW_TRIALS bootstrap resamples (W1 sampling noise).
-    Returns {label: {metric: (mean, std)}} for the labels that are computable."""
+    """Reference + baseline rows for the part-1 tables, computed once and model-
+    independent (no DGP re-simulation):
+      * Train -- simulated-training stylized-fact means (the train reference row).
+      * LW    -- rolling Ledoit-Wolf at the val indices: stylized-fact means (for the
+                 values table) plus per-asset variance levels and the variance W1.
+    The simulated-validation reference and the SGM/SGCM columns come from the per-seed
+    runs. Returns {label: {key: (value, 0.0)}} -- single-set point estimates."""
     if TARGET != "covariance":
         print("[dist-fidelity] baselines need TARGET='covariance'; skipping")
         return {}
-    _, val_ds, _ = make_logcov_datasets(
+    from scipy.stats import wasserstein_distance
+    train_ds, val_ds, _ = make_logcov_datasets(
         DATA_PATH, gap=GAP, cond_path=None, target=TARGET,
         split=SPLIT, n_val_blocks=N_VAL_BLOCKS,
     )
+    C_train = torch.load(C_PATH, weights_only=True).float()[train_ds.idx]
     Cov_real = torch.load(COV_PATH, weights_only=True).float()[val_ds.idx]
-    C_real = torch.load(C_PATH, weights_only=True).float()[val_ds.idx]
-    n = cfg["n_samples"]
+    var_real = torch.diagonal(Cov_real, dim1=-2, dim2=-1).flatten().numpy()
+    pt = lambda d: {k: (float(v), 0.0) for k, v in d.items()}   # point estimate -> (val, 0)
     out = {}
 
-    # --- True (DGP oracle): independent re-simulated H_t paths -----------------
-    oracle_paths = sorted((ROOT / "data").glob("sim_cov_seed*.npy"))
-    runs = []
-    for p in oracle_paths:
-        H = torch.from_numpy(np.load(p)).float()
-        H = 0.5 * (H + H.transpose(-1, -2))            # enforce symmetry (fp drift)
-        Sig = _subsample(H, n)                          # match the generated sample size
-        C, _ = to_correlation(Sig)
-        runs.append(w1_facts(C_real, C, Sigma_real=Cov_real, Sigma_gen=Sig))
-    if runs:
-        out["True"] = aggregate_runs(runs)
-        print(f"[dist-fidelity] True row from {len(runs)} oracle path(s)")
-    else:
-        print("[dist-fidelity] no oracle paths (data/sim_cov_seed*.npy) -- run dcc.py "
-              "with ORACLE_SEEDS to populate the True row; skipping it for now")
+    # simulated-training stylized-fact means (the train reference row)
+    out["Train"] = pt(fact_means(C_train))
 
-    # --- LW baseline: rolling Ledoit-Wolf at the val indices -------------------
+    # Ledoit-Wolf baseline at the val indices: fact means + variance levels/W1
     returns = np.load(ROOT / "data" / "sim_returns.npy")
     lw_cov, keep = rolling_lw_covariances(returns, val_ds.idx.numpy(), LW_WINDOW)
-    var_real = torch.diagonal(Cov_real, dim1=-2, dim2=-1).flatten()  # val ref (constant)
-    runs = []
-    for t in range(LW_TRIALS):
-        Sig = _bootstrap(lw_cov, t)
-        C, _ = to_correlation(Sig)
-        r = w1_facts(C_real, C, Sigma_real=Cov_real, Sigma_gen=Sig)
-        v = torch.diagonal(Sig, dim1=-2, dim2=-1).flatten()
-        # variance levels so the LW column of the scale table is self-contained
-        r.update(var_mean_gen=float(v.mean()), var_median_gen=float(v.median()),
-                 var_mean_real=float(var_real.mean()), var_median_real=float(var_real.median()))
-        runs.append(r)
-    out["LW"] = aggregate_runs(runs)
-    print(f"[dist-fidelity] LW row from {len(lw_cov)} trailing-window estimates "
-          f"(window={LW_WINDOW}, {len(val_ds.idx) - len(keep)} early val idx dropped)")
+    lw_corr, _ = to_correlation(lw_cov)
+    var_lw = torch.diagonal(lw_cov, dim1=-2, dim2=-1).flatten().numpy()
+    lw = pt(fact_means(lw_corr))
+    lw.update(pt({
+        "var_mean_gen":    float(var_lw.mean()),
+        "var_median_gen":  float(np.median(var_lw)),
+        "var_mean_real":   float(var_real.mean()),
+        "var_median_real": float(np.median(var_real)),
+        "w1_variance":     float(wasserstein_distance(var_real, var_lw)),
+    }))
+
+    # LW per-regime W1 (bin-vs-bin, like SGCM): bin each LW estimate by the regime of
+    # its target index -- the trailing window makes LW implicitly regime-adaptive.
+    if COND_PATH is not None:
+        cond_full = torch.load(COND_PATH, weights_only=True).float().reshape(-1)
+        cond_lw = cond_full[torch.from_numpy(np.asarray(keep))]
+        lw_reg = regime_binned_eval(cond_full[val_ds.idx], Cov_real, lw_cov, cond_gen=cond_lw)
+        lw.update(pt({k: v for k, v in lw_reg.items()
+                      if k.endswith(("w1_offdiag", "w1_variance"))}))
+    out["LW"] = lw
+    print(f"[dist-fidelity] LW from {len(lw_cov)} trailing-window estimates "
+          f"(window={LW_WINDOW}, {len(val_ds.idx) - len(keep)} early val idx dropped); "
+          f"train reference from {len(C_train)} matrices")
     return out
-
-
-def check_true_variance(cfg=CFG):
-    """TEMP diagnostic (no training): does the DGP oracle ALSO overshoot val in
-    scale? If so, val is a low-variance finite draw rather than the model being
-    biased. Prints the True (oracle) variance W1 to val and the val/train/oracle
-    variance levels. Reads only the oracle .npy paths and the val split, so it runs
-    independently of any model. On Colab:
-
-        python -c "import src.train_baseline as t; t.check_true_variance()"
-    """
-    from scipy.stats import wasserstein_distance
-    from src.data.dataset import _split_indices
-
-    Cov_all = torch.load(COV_PATH, weights_only=True).float()
-    train_idx, val_idx = _split_indices(len(Cov_all), 0.2, GAP, SPLIT, N_VAL_BLOCKS)
-    diag = lambda S: torch.diagonal(S, dim1=-2, dim2=-1).flatten().numpy()
-    var_val, var_train = diag(Cov_all[val_idx]), diag(Cov_all[train_idx])
-    n = cfg["n_samples"]
-
-    oracle_paths = sorted((ROOT / "data").glob("sim_cov_seed*.npy"))
-    if not oracle_paths:
-        print("[true-var] no oracle paths (data/sim_cov_seed*.npy); run dcc.py first")
-        return
-    w1s, means, medians = [], [], []
-    for p in oracle_paths:
-        H = torch.from_numpy(np.load(p)).float()
-        H = 0.5 * (H + H.transpose(-1, -2))
-        v = diag(_subsample(H, n))                      # match the generated sample size
-        w1s.append(float(wasserstein_distance(var_val, v)))
-        means.append(float(v.mean())); medians.append(float(np.median(v)))
-
-    print(f"[true-var] oracle paths: {len(oracle_paths)}   n_subsample={n}")
-    print(f"  val     mean={var_val.mean():.3f}  median={np.median(var_val):.3f}")
-    print(f"  train   mean={var_train.mean():.3f}  median={np.median(var_train):.3f}")
-    print(f"  oracle  mean={np.mean(means):.3f}  median={np.mean(medians):.3f}")
-    print(f"  TRUE w1_variance (oracle vs val) = {np.mean(w1s):.4f} +/- {np.std(w1s):.4f}")
-    print(f"  reference (your run): SGM 0.389  SGCM 0.440  LW 0.177")
 
 
 def _fmt_cell(d):
@@ -472,26 +422,50 @@ def _print_table(head_label, head_cols, rows):
         print(f"{label:>24s} | " + " | ".join(_fmt_cell(c) for c in cells))
 
 
-# --- Table 1: stylized facts (W1 to val), True / SGM / SGCM / LW ---------------
-FACTS_ROWS = [
-    ("w1_offdiag",     "off-diagonal correlation"),
-    ("w1_gini",        "eigenvalue Gini"),
-    ("w1_coph_single", "cophenetic (single)"),
-    ("w1_coph_ward",   "cophenetic (ward)"),
-    ("w1_perron",      "Perron-Frobenius"),
-    ("w1_powerlaw",    "eigenvalue power-law"),
+# --- Table 1: stylized-fact VALUES (Kubiak-style), rows = sets, cols = facts ------
+# Each row reads from a different key convention in `agg`:
+#   Simulated Training   -> agg["Train"]["{f}_mean"]        (point, from fact_means)
+#   Simulated Validation -> agg["SGM"]["{f}_mean_real"]     (the fixed val reference)
+#   SGM / SGCM           -> agg[model]["{f}_mean_gen"]      (across-seed mean)
+#   LW                   -> agg["LW"]["{f}_mean"]           (point, from fact_means)
+FACT_COLS = [
+    ("offdiag",     "off-diag corr"),
+    ("gini",        "Gini"),
+    ("coph_single", "coph (single)"),
+    ("coph_ward",   "coph (ward)"),
+    ("perron",      "Perron"),
+    ("powerlaw",    "power-law"),
+]
+FACT_ROWS = [
+    ("Simulated Training",   "Train", "{f}_mean"),
+    ("Simulated Validation", "SGM",   "{f}_mean_real"),
+    ("SGM",                  "SGM",   "{f}_mean_gen"),
+    ("SGCM",                 "SGCM",  "{f}_mean_gen"),
+    ("LW",                   "LW",    "{f}_mean"),
 ]
 
 
-def write_facts_table(agg):
-    """Table 1 -- stylized-fact W1 to the val reference, one column per model.
-    Read SGM/SGCM against True (the floor they should approach) and LW (baseline)."""
-    cols = [c for c in ("True", "SGM", "SGCM", "LW") if c in agg]
-    rows = [(label, [agg[c].get(key) for c in cols]) for key, label in FACTS_ROWS]
+def write_facts_values_table(agg):
+    """Table 1 -- mean stylized-fact VALUES per set (simulated train/val reference,
+    SGM, SGCM, LW); columns are the facts. Compare each set against the train/val
+    reference range (Kubiak-style), no W1 floor."""
+    def value(src, key):
+        d = agg.get(src, {}).get(key)
+        return None if d is None else d[0]
+
     out = ROOT / "results" / f"facts{SUFFIX}{TAG}.csv"
-    _write_csv(out, "stylized_fact", cols, rows)
-    print(f"\n[Table 1] stylized facts (W1 to val) -> {out}")
-    _print_table("stylized fact", cols, rows)
+    with out.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["set"] + [name for _, name in FACT_COLS])
+        for rlabel, src, keyfmt in FACT_ROWS:
+            cells = [value(src, keyfmt.format(f=fact)) for fact, _ in FACT_COLS]
+            w.writerow([rlabel] + ["" if c is None else f"{c:.4f}" for c in cells])
+    print(f"\n[Table 1] stylized-fact values -> {out}")
+    print(f"{'set':>22s} | " + " | ".join(f"{name:^14s}" for _, name in FACT_COLS))
+    for rlabel, src, keyfmt in FACT_ROWS:
+        cells = [value(src, keyfmt.format(f=fact)) for fact, _ in FACT_COLS]
+        print(f"{rlabel:>22s} | " + " | ".join(
+            f"{'--':^14s}" if c is None else f"{c:^14.4f}" for c in cells))
 
 
 # --- Table 2: regime-specific W1, SGM vs SGCM ----------------------------------
@@ -500,9 +474,12 @@ REGIME_BINS = [("regime_pooled_", "pooled"), ("regime_lo_", "lo"),
 
 
 def write_regime_table(agg):
-    """Table 2 -- per-regime W1 (off-diag + variance) for SGM vs SGCM. SGM is the
-    regime-blind marginal-vs-bin baseline; SGCM the conditional bin-vs-bin."""
+    """Table 2 -- per-regime W1 (off-diag + variance). SGM is the regime-blind
+    marginal-vs-bin baseline; SGCM (explicit conditioning) and LW (implicit, via its
+    trailing window) are both bin-vs-bin."""
     models = [c for c in ("SGM", "SGCM") if c in agg]
+    if "LW" in agg and "regime_pooled_w1_offdiag" in agg["LW"]:
+        models.append("LW")
     if not models:
         return
     cols = [(f"{mdl} {mlbl}", mdl, suf)
@@ -524,8 +501,7 @@ VAR_ROWS = [("mean variance", "mean"), ("median variance", "median"),
 
 def write_variance_table(agg):
     """Table 3 -- pooled per-asset variance: real-vs-generated levels (mean,
-    median) and W1-to-val. No True column: the DGP oracle's scale is the real law
-    by construction, so the meaningful comparison is real vs each generator."""
+    median) and W1-to-val, for the validation reference and each generator."""
     model_cols = [c for c in ("SGM", "SGCM", "LW") if c in agg]
     ref = next((agg[c] for c in model_cols if "var_mean_real" in agg[c]), None)
     if ref is None:
@@ -549,10 +525,10 @@ def write_variance_table(agg):
 def run_experiments(seeds=SEEDS, variants=VARIANTS):
     """Run every (variant, seed) combination, then assemble the part-1 result
     tables. Model columns (SGM unconditional vs SGCM conditional) are aggregated
-    mean +- std across seeds; the model-independent True (DGP oracle) and LW
-    baseline columns come from distributional_fidelity_baselines(). Writes the full
-    per-metric model summary plus three focused tables: (1) stylized facts, (2)
-    regime-specific W1, (3) variance/scale."""
+    mean +- std across seeds; the simulated-training reference and LW baseline rows
+    come from distributional_fidelity_baselines(). Writes the full per-metric model
+    summary plus three focused tables: (1) stylized-fact values, (2) regime-specific
+    W1, (3) variance/scale."""
     agg = {}
     for label, override in variants.items():
         runs = []
@@ -582,11 +558,11 @@ def run_experiments(seeds=SEEDS, variants=VARIANTS):
             cells.append(f"{mean:9.4f} ± {std:7.4f}")
         print(f"{m:>22s} | " + " | ".join(cells))
 
-    # part-1 result tables: add True + LW columns, then write the three focused tables.
+    # part-1 result tables: add Train + LW reference rows, then write the three tables.
     agg.update(distributional_fidelity_baselines())
-    write_facts_table(agg)       # Table 1: stylized facts (W1 to val)
-    write_regime_table(agg)      # Table 2: regime-specific W1 (SGM vs SGCM)
-    write_variance_table(agg)    # Table 3: variance / scale (real vs generated)
+    write_facts_values_table(agg)  # Table 1: stylized-fact values (train/val/SGM/SGCM/LW)
+    write_regime_table(agg)        # Table 2: regime-specific W1 (SGM vs SGCM)
+    write_variance_table(agg)      # Table 3: variance / scale (real vs generated)
     return agg
 
 

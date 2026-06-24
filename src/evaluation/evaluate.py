@@ -262,23 +262,16 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
     return out
 
 
-def w1_facts(C_real, C_gen, Sigma_real=None, Sigma_gen=None):
-    """Per-stylized-fact W1 of `gen` against a FIXED `real` reference, no floor.
-    The single-number-per-fact scorer shared by every row of the distributional-
-    fidelity table (True / SGM / SGCM / LW) so all four are computed identically.
-
-    C_real, C_gen: correlation batches (T, N, N) for the correlation facts.
-    Sigma_real, Sigma_gen: optional covariance batches; when both given, adds the
-    pooled per-asset variance W1 (the scale dimension the correlation facts drop).
-    """
-    fr = _per_matrix_facts(_subsample(C_real, FACT_SUBSAMPLE))
-    fg = _per_matrix_facts(_subsample(C_gen, FACT_SUBSAMPLE))
-    out = {"w1_offdiag": w1_offdiag(C_real, C_gen)}
+def fact_means(C):
+    """Mean stylized-fact VALUES over a correlation batch (for the values table:
+    simulated train/val reference rows and the LW row). Off-diagonal correlation
+    is the mean over the full pooled off-diagonal; the per-matrix facts are meaned
+    over a FACT_SUBSAMPLE-sized subsample (matching eval_and_plot). Returns
+    {offdiag_mean, gini_mean, coph_single_mean, coph_ward_mean, perron_mean, powerlaw_mean}."""
+    f = _per_matrix_facts(_subsample(C, FACT_SUBSAMPLE))
+    out = {"offdiag_mean": float(_offdiag(C).flatten().mean())}
     for n in FACT_NAMES:
-        out[f"w1_{n}"] = _safe_w1(fr[n], fg[n])
-    if Sigma_real is not None and Sigma_gen is not None:
-        out["w1_variance"] = float(wasserstein_distance(
-            _var_pooled(Sigma_real), _var_pooled(Sigma_gen)))
+        out[f"{n}_mean"] = float(np.nanmean(f[n]))
     return out
 
 
@@ -314,23 +307,6 @@ def rolling_lw_covariances(returns, idx, window):
     out = np.empty((len(keep), returns.shape[1], returns.shape[1]))
     for j, t in enumerate(keep):
         out[j] = ledoit_wolf(returns[t - window:t])
-    return torch.from_numpy(out).float(), keep
-
-
-def rolling_sample_covariances(returns, idx, window):
-    """Strictly-causal trailing *sample* covariance at each index in `idx` -- the
-    unshrunk counterpart of rolling_lw_covariances, sharing its causal convention
-    (returns[t-window:t], excludes t, t<window dropped). This is the classic GMVP
-    baseline that Ledoit-Wolf shrinkage is meant to beat out-of-sample.
-    returns: (T, N); idx: 1-D int array. -> (m, N, N) float32, plus kept indices."""
-    returns = np.asarray(returns, dtype=np.float64)
-    idx = np.asarray(idx)
-    keep = idx[idx >= window]
-    out = np.empty((len(keep), returns.shape[1], returns.shape[1]))
-    for j, t in enumerate(keep):
-        X = returns[t - window:t]
-        X = X - X.mean(0, keepdims=True)
-        out[j] = (X.T @ X) / len(X)
     return torch.from_numpy(out).float(), keep
 
 
