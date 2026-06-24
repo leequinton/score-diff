@@ -320,11 +320,11 @@ def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
     """Heatmap grid (viridis) for a visual plausibility check: n real vs n generated
     matrices, showing whether generated matrices reproduce block/sector structure.
 
-    With `show_cov` (the covariance target), `real`/`gen` are covariance batches and
-    the figure has FOUR row-blocks -- covariance (real, gen) then the correlation of
-    the SAME sampled matrices (real, gen) -- since the model produces both at once,
-    so you see each matrix on both scales. Otherwise `real`/`gen` are correlations
-    and only the two correlation blocks are drawn.
+    Layout: rows are real (top) / generated (bottom); columns are grouped, with
+    `show_cov` (covariance target) giving two side-by-side groups -- covariance and
+    the correlation of the SAME sampled matrices -- since the model produces both at
+    once, so each matrix is shown on both scales. Otherwise only the correlation
+    group is drawn. Each group has its own horizontal colorbar.
 
     Covariance rows use a *sequential* 0->vmax scale with gamma compression:
     covariance entries are almost all positive, so a symmetric diverging map wastes
@@ -338,39 +338,35 @@ def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
     real_s = (real.numpy() if hasattr(real, "numpy") else np.asarray(real))[ridx]
     gen_s  = (gen.numpy()  if hasattr(gen,  "numpy") else np.asarray(gen))[gidx]
 
+    # column groups (each n wide); rows are real (top) / generated (bottom)
     if show_cov:
-        blocks = [("covariance\n(real)", "cov", real_s),
-                  ("covariance\n(generated)", "cov", gen_s),
-                  ("correlation\n(real)", "corr", _normalize_cov_np(real_s)),
-                  ("correlation\n(generated)", "corr", _normalize_cov_np(gen_s))]
+        groups = [("covariance",  "cov",  real_s, gen_s),
+                  ("correlation", "corr", _normalize_cov_np(real_s), _normalize_cov_np(gen_s))]
         cov_norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=float(np.percentile(real_s, 99.0)))
     else:
-        blocks = [("correlation\n(real)", "corr", real_s),
-                  ("correlation\n(generated)", "corr", gen_s)]
+        groups = [("correlation", "corr", real_s, gen_s)]
         cov_norm = None
 
-    nrows = len(blocks)
-    fig, axes = plt.subplots(nrows, n, figsize=(3 * n + 1, 3 * nrows))
-    axes = np.atleast_2d(axes)
-    im_cov = im_corr = None
-    for r, (label, kind, data) in enumerate(blocks):
+    ncols = n * len(groups)
+    fig, axes = plt.subplots(2, ncols, figsize=(2.6 * ncols + 0.6, 6.2), squeeze=False)
+    ims = {}
+    for g, (glabel, kind, rdata, gdata) in enumerate(groups):
         for c in range(n):
-            ax = axes[r, c]
-            if kind == "cov":
-                im_cov = ax.imshow(data[c], cmap="viridis", norm=cov_norm)
-            else:
-                im_corr = ax.imshow(data[c], cmap="viridis", vmin=-1.0, vmax=1.0)
-            ax.set_xticks([]); ax.set_yticks([])
-            if c == 0:
-                ax.set_ylabel(label, fontsize=11)
-
-    # one colorbar per scale, each spanning its own row-blocks
-    if im_cov is not None:
-        cov_axes = [axes[r, c] for r in range(nrows) if blocks[r][1] == "cov" for c in range(n)]
-        fig.colorbar(im_cov, ax=cov_axes, shrink=0.6, label="covariance")
-    corr_axes = [axes[r, c] for r in range(nrows) if blocks[r][1] == "corr" for c in range(n)]
-    fig.colorbar(im_corr, ax=corr_axes, shrink=0.6, label="correlation")
-    fig.suptitle("Sample matrices: real vs generated")
+            col = g * n + c
+            for row, data in ((0, rdata), (1, gdata)):
+                ax = axes[row, col]
+                if kind == "cov":
+                    ims[kind] = ax.imshow(data[c], cmap="viridis", norm=cov_norm)
+                else:
+                    ims[kind] = ax.imshow(data[c], cmap="viridis", vmin=-1.0, vmax=1.0)
+                ax.set_xticks([]); ax.set_yticks([])
+                if col == 0:
+                    ax.set_ylabel(("real", "generated")[row], fontsize=12)
+        # one horizontal colorbar under each column group, labelled by scale
+        grp_axes = [axes[r, g * n + c] for r in (0, 1) for c in range(n)]
+        fig.colorbar(ims[kind], ax=grp_axes, orientation="horizontal",
+                     fraction=0.05, pad=0.06, label=glabel)
+    fig.suptitle("Sample matrices: real (top) vs generated (bottom)", fontsize=13)
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
