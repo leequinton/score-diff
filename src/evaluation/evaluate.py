@@ -310,6 +310,23 @@ def rolling_lw_covariances(returns, idx, window):
     return torch.from_numpy(out).float(), keep
 
 
+def rolling_sample_covariances(returns, idx, window):
+    """Strictly-causal trailing *sample* covariance at each index in `idx` -- the
+    unshrunk counterpart of rolling_lw_covariances, sharing its causal convention
+    (returns[t-window:t], excludes t, t<window dropped). The classic baseline that
+    Ledoit-Wolf shrinkage is meant to improve on out-of-sample.
+    returns: (T, N); idx: 1-D int array. -> (m, N, N) float32, plus kept indices."""
+    returns = np.asarray(returns, dtype=np.float64)
+    idx = np.asarray(idx)
+    keep = idx[idx >= window]
+    out = np.empty((len(keep), returns.shape[1], returns.shape[1]))
+    for j, t in enumerate(keep):
+        X = returns[t - window:t]
+        X = X - X.mean(0, keepdims=True)
+        out[j] = (X.T @ X) / len(X)
+    return torch.from_numpy(out).float(), keep
+
+
 def _normalize_cov_np(M):
     """Batch of covariances (k, N, N) -> correlations, in numpy."""
     d = np.sqrt(np.clip(np.diagonal(M, axis1=-2, axis2=-1), 1e-12, None))

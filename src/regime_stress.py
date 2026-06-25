@@ -13,13 +13,17 @@ distribution of annualised portfolio volatility sqrt(w'Σw):
   * SGCM  -- conditional model, sampled at that regime's conditioning value.
   * SGM   -- unconditional model: one regime-blind distribution, the SAME for every
              regime, so it cannot track the regime.
+  * Sample-- rolling trailing sample covariance at the regime's indices (the
+             unshrunk baseline LW improves on; a point per date).
   * LW    -- rolling Ledoit-Wolf at the regime's validation indices (a point per
              date; implicitly regime-adaptive through its trailing window).
 
-Metrics per regime: median and 95th-percentile (stress) portfolio vol, and the
-Wasserstein-1 distance of each estimator's risk distribution to True. The high/low
-risk ratio is reported separately as a scale-robust summary (it cancels the model's
-overall scale bias, isolating the regime structure).
+Metrics per regime: median, 95th- and 99th-percentile (stress) portfolio vol, and
+the Wasserstein-1 distance of each estimator's risk distribution to True. The 95th/
+99th percentiles are the 5%/1% tail stress levels (in vol units; under a Gaussian
+return model they map to 5%/1% VaR via VaR_a = z_a * vol). The high/low risk ratio
+is reported separately as a scale-robust summary (it cancels the model's overall
+scale bias, isolating the regime structure).
 
 Reuses the trained simulated checkpoints from the part-1 run -- no new training.
 """
@@ -37,7 +41,9 @@ from scipy.stats import wasserstein_distance
 from src.data.dataset import make_logcov_datasets
 from src.diffusion.sde import VPSDE
 from src.diffusion.solver import sample_logcov
-from src.evaluation.evaluate import logcov_to_covariance, rolling_lw_covariances
+from src.evaluation.evaluate import (
+    logcov_to_covariance, rolling_lw_covariances, rolling_sample_covariances,
+)
 from src.models.logcov_gnn import LogCovScoreGNN
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,11 +57,11 @@ ANN = math.sqrt(252.0)                       # daily -> annual vol (FF returns i
 BIN_LABELS = ("lo", "mid", "hi")
 
 SEEDS = (0, 1, 2, 3, 4)
-N_PER_REGIME = 2000                          # SGCM draws per regime bin
+N_PER_REGIME = 3000                          # SGCM draws per regime bin
 N_POOL = 3000                                # SGM unconditional pool
 GEN_CHUNK = 1024                             # sampler batch cap (GPU memory)
 GEN_EPS_T, SDE_STEPS = 1e-3, 1000
-Q_STRESS = 0.95
+Q95, Q99 = 0.95, 0.99                        # 5% / 1% tail stress levels (vol units)
 
 
 def _ckpt_path(seed, cond_dim):
@@ -85,7 +91,8 @@ def dist_metrics(vols, true_vols):
     """Distribution summary of a portfolio-vol sample vs the True distribution."""
     return {
         "median_vol": float(np.median(vols)),
-        "q95_vol":    float(np.quantile(vols, Q_STRESS)),
+        "q95_vol":    float(np.quantile(vols, Q95)),
+        "q99_vol":    float(np.quantile(vols, Q99)),
         "w1_to_true": float(wasserstein_distance(vols, true_vols)),
     }
 
@@ -204,19 +211,20 @@ def main(seeds=SEEDS):
     print(f"val OOS dates: {len(cond_raw)}  N={n_assets}  "
           f"bin sizes: {[int(m.sum()) for m in masks]}")
 
-    # True distribution per regime (the ground-truth target) + LW per regime
+    # True distribution per regime (ground truth) + rolling sample/LW baselines
     returns = np.load(ROOT / "data" / "sim_returns.npy")
-    lw_cov, keep = rolling_lw_covariances(returns, val_ds.idx.numpy(), LW_WINDOW)
-    cond_lw = cond_raw[np.isin(val_ds.idx.numpy(), keep)]    # regime of each LW estimate
-    lw_masks = regime_masks(cond_raw)                        # same edges, applied to kept set
-    lw_edges = np.quantile(cond_raw, np.linspace(0, 1, len(BIN_LABELS) + 1))
-    lw_edges[0], lw_edges[-1] = -np.inf, np.inf
+    samp_cov, keep = rolling_sample_covariances(returns, val_ds.idx.numpy(), LW_WINDOW)
+    lw_cov, _      = rolling_lw_covariances(returns, val_ds.idx.numpy(), LW_WINDOW)
+    cond_roll = cond_raw[np.isin(val_ds.idx.numpy(), keep)]  # regime of each rolling estimate
+    edges = np.quantile(cond_raw, np.linspace(0, 1, len(BIN_LABELS) + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
 
-    true_vols, lw_vols = [], []
+    true_vols, samp_vols, lw_vols = [], [], []
     for k in range(len(BIN_LABELS)):
         true_vols.append(portfolio_vol(Cov_val[torch.from_numpy(masks[k])], w))
-        lwm = (cond_lw >= lw_edges[k]) & (cond_lw < lw_edges[k + 1])
-        lw_vols.append(portfolio_vol(lw_cov[torch.from_numpy(lwm)], w))
+        rm = (cond_roll >= edges[k]) & (cond_roll < edges[k + 1])
+        samp_vols.append(portfolio_vol(samp_cov[torch.from_numpy(rm)], w))
+        lw_vols.append(portfolio_vol(lw_cov[torch.from_numpy(rm)], w))
 
     # sample each bin's empirical normalised cond distribution for conditional generation
     g = torch.Generator().manual_seed(0)
@@ -227,12 +235,14 @@ def main(seeds=SEEDS):
         cond_samples_by_bin.append(pool[sel])               # (N_PER_REGIME, cond_dim)
 
     # assemble per-estimator, per-regime metrics
-    agg = {label: {} for label in ("True", "SGM", "SGCM", "LW")}
+    agg = {label: {} for label in ("True", "SGM", "SGCM", "Sample", "LW")}
     for k, lbl in enumerate(BIN_LABELS):
         agg["True"][lbl] = {"median_vol": (float(np.median(true_vols[k])), 0.0),
-                            "q95_vol": (float(np.quantile(true_vols[k], Q_STRESS)), 0.0),
+                            "q95_vol": (float(np.quantile(true_vols[k], Q95)), 0.0),
+                            "q99_vol": (float(np.quantile(true_vols[k], Q99)), 0.0),
                             "w1_to_true": (0.0, 0.0)}
-        agg["LW"][lbl] = {m: (v, 0.0) for m, v in dist_metrics(lw_vols[k], true_vols[k]).items()}
+        agg["Sample"][lbl] = {m: (v, 0.0) for m, v in dist_metrics(samp_vols[k], true_vols[k]).items()}
+        agg["LW"][lbl]     = {m: (v, 0.0) for m, v in dist_metrics(lw_vols[k], true_vols[k]).items()}
 
     for label, cond_dim in (("SGM", 0), ("SGCM", cond_norm.shape[-1])):
         per_seed = {lbl: [] for lbl in BIN_LABELS}
@@ -255,13 +265,14 @@ def main(seeds=SEEDS):
 
 
 # metrics x (estimator) printed/saved per regime
-_METRICS = [("q95_vol", "stress vol (q95, ann)"),
+_METRICS = [("q99_vol", "stress vol (q99, ann)"),
+            ("q95_vol", "stress vol (q95, ann)"),
             ("median_vol", "median vol (ann)"),
             ("w1_to_true", "W1 to true (vol)")]
 
 
 def _write_outputs(agg):
-    cols = [c for c in ("True", "SGM", "SGCM", "LW") if any(agg[c].values())]
+    cols = [c for c in ("True", "SGM", "SGCM", "Sample", "LW") if any(agg[c].values())]
     out = ROOT / "results" / "regime_stress_sim.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="") as f:
@@ -283,12 +294,13 @@ def _write_outputs(agg):
                 f"{'--':^16s}" if x is None else f"{x[0]:8.4f} ± {x[1]:6.4f}" for x in cells))
 
     # scale-robust summary: high/low stress-vol ratio per estimator
-    print("\nhigh/low stress-vol ratio (scale-robust)")
-    for c in cols:
-        hi = agg[c].get("hi", {}).get("q95_vol")
-        lo = agg[c].get("lo", {}).get("q95_vol")
-        if hi and lo and lo[0] > 0:
-            print(f"  {c:>6s}: {hi[0] / lo[0]:.3f}")
+    for key in ("q95_vol", "q99_vol"):
+        print(f"\nhigh/low {key} ratio (scale-robust)")
+        for c in cols:
+            hi = agg[c].get("hi", {}).get(key)
+            lo = agg[c].get("lo", {}).get(key)
+            if hi and lo and lo[0] > 0:
+                print(f"  {c:>6s}: {hi[0] / lo[0]:.3f}")
 
 
 if __name__ == "__main__":
