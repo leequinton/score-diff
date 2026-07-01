@@ -1,15 +1,24 @@
 # graph_diffusion
 
-Score-based diffusion for **factor-structured covariance matrices** of asset returns.
+Score-based diffusion for **covariance matrices** of asset returns, trained and
+evaluated on a calibrated DCC-GARCH simulation.
 
-A bipartite graph neural network predicts the noise in a variance-preserving SDE
-over the factor decomposition `Σ = B F Bᵀ + D`, where `B` are factor loadings,
-`F` the factor covariance, and `D` the idiosyncratic variances. A full-Cholesky
-model on the unstructured `N×N` correlation matrix serves as the baseline, so the
-only thing that varies between the two is the structural prior.
+The model diffuses the **matrix logarithm** `S = logm(Σ)` of a covariance (or
+correlation) matrix. Working in log-Euclidean space makes the target unconstrained
+— any symmetric matrix is a valid `logm`, and `expm` maps back to an SPD matrix —
+so the network never has to enforce positive-definiteness. A transformer score
+network (`LogCovScoreGNN`) predicts the noise in a variance-preserving SDE
+(epsilon-prediction / denoising score matching).
 
-Regime conditioning (trailing equity- and interest-rate volatility) is supported
-via classifier-free guidance.
+Regime conditioning (trailing market volatility) is supported via classifier-free
+guidance, giving two variants that are compared throughout:
+
+- **SGM** — unconditional score-based generative model (regime-blind).
+- **SGCM** — conditional model, conditioned on the trailing-vol regime.
+
+Because the data-generating process is a known DCC-GARCH, the true conditional
+covariance `H_t` is available as an oracle, so distributional fidelity can be
+measured directly rather than against a proxy.
 
 ## Setup
 
@@ -17,54 +26,67 @@ via classifier-free guidance.
 pip install -r requirements.txt
 ```
 
-Data is **not** versioned; it is regenerated from public sources. Download from
-the Kenneth French data library and FRED:
+Raw data is **not** versioned; it is regenerated from public sources. Place these
+in `data/raw/`:
 
-- `49_Industry_Portfolios_Daily.CSV` (value-weighted returns)
-- `F-F_Research_Data_5_Factors_2x3_daily.CSV`
+- `49_Industry_Portfolios_Daily.csv` (Kenneth French data library, value-weighted)
+- `F-F_Research_Data_5_Factors_2x3_daily.csv` (Kenneth French data library)
 - `DGS10.csv` (FRED 10-year Treasury yield)
 
-Then build the processed tensors:
+## Data pipeline
+
+The training data is a simulated DCC-GARCH covariance path calibrated to the
+industry returns:
 
 ```bash
-python data/prep_factors_daily.py \
-    --industries 49_Industry_Portfolios_Daily.CSV \
-    --factors    F-F_Research_Data_5_Factors_2x3_daily.CSV \
-    --dgs10      DGS10.csv
+python src/sim/diagnostics.py     # (optional) stationarity / GARCH-suitability checks
+python src/sim/dcc.py             # fit + simulate -> data/sim_cov.npy, data/sim_returns.npy
+python src/sim/prepare_sim.py     # -> data/processed/{Cov_sim,C_sim,cond_sim}.pt
 ```
 
-This writes `B/F/C/D` tensors and the `cond` tensor to `data/processed/`.
+`prepare_sim.py` writes the covariance/correlation tensors plus a strictly-causal
+trailing-market-vol conditioning series that never sees `H_t`.
 
 ## Running
 
 ```bash
-python -m src.train               # bipartite, single seed
-python -m src.train_baseline      # full-Cholesky baseline, single seed
-python -m src.train_multiseed --seeds 0 1 2     # both models, aggregated mean ± std
+python -m src.train_baseline      # multi-seed sweep: SGM + SGCM, mean ± std tables
+python -m src.regime_stress       # portfolio stress-test application (reuses checkpoints)
 ```
 
-Outputs (loss curves, real-vs-generated diagnostics, regime sweeps, multiseed JSON)
-are written to `results/`; checkpoints to `checkpoints/`. Both directories are
-created on demand and are git-ignored.
+`train_baseline.py` runs every `(variant, seed)` combination, then writes the
+part-1 result tables (stylized-fact values, regime-specific W1, variance/scale)
+alongside Ledoit-Wolf and simulated-training/validation reference rows. Loss curves,
+real-vs-generated diagnostics and sample-matrix heatmaps go to `results/`;
+checkpoints (with EMA weights) to `checkpoints/`. Both directories are created on
+demand and git-ignored.
+
+`regime_stress.py` reuses the trained checkpoints, with no new training, to compare
+the distribution of portfolio volatility `sqrt(wᵀΣw)` per volatility regime against
+the DGP oracle and the Ledoit-Wolf / sample-covariance baselines.
 
 ## Layout
 
 | Path | Contents |
 |------|----------|
-| `data/factor_model.py` | rolling-window factor regressions (B, F, C, D) |
-| `data/prep_factors_daily.py` | daily data prep + conditioning variables |
-| `src/data/dataset.py` | datasets, normalisers, temporal train/val split |
+| `data/loaders.py` | Kenneth French daily CSV loader |
+| `src/sim/diagnostics.py` | stationarity / GARCH-suitability diagnostics + return panel |
+| `src/sim/dcc.py` | DCC-GARCH calibration and simulation |
+| `src/sim/prepare_sim.py` | simulated path → processed `.pt` tensors + conditioning |
+| `src/data/dataset.py` | matrix-log dataset, normaliser, blocked/contiguous split |
 | `src/diffusion/sde.py` | variance-preserving SDE |
 | `src/diffusion/losses.py` | denoising score-matching loss (+ CFG dropout) |
 | `src/diffusion/solver.py` | reverse-time sampler (+ classifier-free guidance) |
-| `src/models/gnn.py` | bipartite factor-structured score network |
-| `src/models/full_chol_gnn.py` | unstructured full-Cholesky baseline |
-| `src/evaluation/evaluate.py` | Wasserstein metrics, stylized-fact diagnostics, regime sweep |
-| `src/train.py`, `src/train_baseline.py` | training drivers |
-| `src/train_multiseed.py` | multi-seed wrapper with aggregated reporting |
+| `src/models/logcov_gnn.py` | transformer score network over the matrix log |
+| `src/models/embeddings.py` | sinusoidal time + conditioning embeddings |
+| `src/evaluation/evaluate.py` | Wasserstein metrics, stylized-fact + regime diagnostics, LW baseline |
+| `src/train_baseline.py` | training driver + multi-seed result tables |
+| `src/regime_stress.py` | regime-conditional portfolio stress-test application |
+| `src/train_utils.py` | EMA, data cycling, loss plotting |
 
 ## Configuration
 
-Each training script has a top-of-file `CFG` dict and `FREQ`/`SUFFIX`/`GAP`
-constants. Set `cond_dim=0` to disable conditioning, `1` for equity-vol only,
-`2` for `[equity vol, rate vol]`.
+`train_baseline.py` has a top-of-file `CFG` dict plus `SOURCE` (`"sim"` /
+`"empirical"`), `TARGET` (`"covariance"` / `"correlation"`), and `SPLIT`
+(`"blocked"` / `"contiguous"`) constants. Set `cond_dim=0` for the unconditional
+SGM and `1` for the trailing-vol-conditioned SGCM; the `VARIANTS` dict runs both.

@@ -1,16 +1,6 @@
-"""Euler-Maruyama reverse-SDE sampler for the log-covariance baseline.
-
-Supports optional classifier-free guidance (Ho and Salimans, 2022):
-
-- cond=None, guidance_scale=0   → unconditional (model uses its null embedding)
-- cond=tensor, guidance_scale=0 → pure conditional
-- cond=tensor, guidance_scale=w → CFG: ε = (1+w)·ε_cond − w·ε_uncond
-                                   w > 0 amplifies the regime beyond training data;
-                                   w = -1 is exactly unconditional.
-
-When CFG is active the model is called twice per timestep (cond + uncond), so
-sampling cost roughly doubles.
-"""
+"""Euler-Maruyama reverse-SDE sampler for the log-covariance baseline, with
+optional classifier-free guidance (Ho and Salimans, 2022): ε = (1+w)·ε_cond −
+w·ε_uncond, calling the model twice per step when w != 0."""
 
 import torch
 
@@ -18,16 +8,14 @@ from src.diffusion.losses import sym_randn_like
 
 
 def _cfg_combine(eps_cond, eps_uncond, w):
-    """Classifier-free-guidance combination: (1+w)·cond − w·uncond."""
     return (1 + w) * eps_cond - w * eps_uncond
 
 
 @torch.no_grad()
 def sample_logcov(model, sde, batch_size, n_assets, device, eps_t=1e-3,
                   cond=None, guidance_scale=0.0):
-    """Reverse-SDE Euler-Maruyama for the log-covariance baseline. The iterate
-    stays symmetric: the model output is symmetric and the injected noise is
-    symmetric, and the per-entry SDE coefficients preserve that symmetry."""
+    """Reverse-SDE Euler-Maruyama. The iterate stays symmetric: model output and
+    injected noise are symmetric, and the SDE coefficients preserve symmetry."""
     N = n_assets
     X = sym_randn_like(torch.empty(batch_size, N, N, device=device))
 

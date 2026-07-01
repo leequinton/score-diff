@@ -1,20 +1,12 @@
-"""Convert the simulated DCC covariance path into the .pt tensors that
-make_logcov_datasets consumes.
-
-`dcc.py` writes data/sim_cov.npy = the conditional covariance path H_t (T, N, N).
-Here we turn it into the same on-disk format as the empirical pipeline:
+"""Convert the simulated DCC covariance path (data/sim_cov.npy) into the .pt tensors
+make_logcov_datasets consumes, matching the empirical pipeline's on-disk format:
 
     data/processed/Cov_sim.pt  - covariances H_t                 (float32, T x N x N)
     data/processed/C_sim.pt    - correlations D^-1/2 H_t D^-1/2  (float32, T x N x N)
     data/processed/cond_sim.pt - causal trailing market vol       (float32, T x 1)
 
-so `train_baseline.py` can point at the simulated data exactly like the empirical
-data. The conditioning series is a strictly-lagged trailing realized volatility of
-the equal-weight market return (built from sim_returns.npy): cond[t] depends only
-on returns up to t-1, so it never sees H_t and is a legitimate regime signal rather
-than leakage. Because the DGP is GARCH, trailing vol is predictive of the current
-conditional scale -- exactly the regime information an unconditional model lacks.
-"""
+The conditioning series is a strictly-lagged trailing realized vol (never sees H_t),
+a legitimate regime signal that an unconditional model lacks."""
 
 import numpy as np
 import pandas as pd
@@ -37,14 +29,9 @@ def to_correlation(Sigma):
 
 
 def trailing_market_vol(returns, window):
-    """Strictly-causal trailing realized vol of the equal-weight market return.
-
-    returns: (T, N) simulated returns. cond[t] = std of the market return over the
-    `window` steps ending at t-1 (the .shift(1) excludes the contemporaneous r_t, so
-    cond[t] is a function of information strictly before H_t -- no leakage of the
-    target's scale). Leading entries, where the window is not yet full, are
-    back-filled with the first computable value (initialises an input feature only).
-    Returns a (T, 1) float32 tensor aligned 1:1 with H_t."""
+    """Strictly-causal trailing realized vol of the equal-weight market return:
+    cond[t] = std over the `window` steps ending at t-1 (.shift(1) excludes r_t, so
+    no leakage). Leading entries are back-filled. -> (T, 1) float32, aligned with H_t."""
     r_mkt = pd.Series(returns.mean(axis=1))                 # equal-weight market return
     vol = r_mkt.shift(1).rolling(window, min_periods=2).std()
     vol = vol.bfill().to_numpy().copy()                    # .copy() -> writable tensor
@@ -53,8 +40,7 @@ def trailing_market_vol(returns, window):
 
 def main():
     H = torch.from_numpy(np.load(RAW)).float()          # (T, N, N) covariance
-    # The simulator builds H = D R D, symmetric up to fp drift; enforce it exactly
-    # so logm/eigh see a genuinely symmetric input.
+    # H = D R D is symmetric up to fp drift; enforce it exactly for logm/eigh
     H = 0.5 * (H + H.transpose(-1, -2))
     C = to_correlation(H)
 

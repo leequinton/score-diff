@@ -21,19 +21,15 @@ class TransformerBlock(nn.Module):
 
 class LogCovScoreGNN(nn.Module):
     """Score network for the symmetric matrix-log S = logm(Sigma).
-
-    x : (batch, N, N) symmetric
-    t : (batch,) diffusion time in [0, 1]
-    returns (batch, N, N), symmetric noise prediction
-    """
+    x: (batch, N, N) symmetric, t: (batch,) in [0, 1] -> (batch, N, N) symmetric."""
 
     def __init__(self, n_assets, hidden_dim=128, n_layers=4, n_heads=4,
                  time_dim=128, dropout=0.0, cond_dim=0):
         super().__init__()
         self.n_assets = n_assets
         self.cond_dim = cond_dim
-        self.embed = nn.Linear(n_assets, hidden_dim) # tokenizes matrix row wise
-        self.pos = nn.Parameter(torch.randn(n_assets, hidden_dim) * 0.02) #asset i gets pos[i], under relabeling pos doesn't change with data -> no equivariance
+        self.embed = nn.Linear(n_assets, hidden_dim)   # tokenize matrix row-wise
+        self.pos = nn.Parameter(torch.randn(n_assets, hidden_dim) * 0.02)  # fixed per-asset pos -> no equivariance
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim),
             nn.Linear(time_dim, hidden_dim),
@@ -42,16 +38,13 @@ class LogCovScoreGNN(nn.Module):
         )
         self.cond_embedding = CondEmbedding(cond_dim, hidden_dim) if cond_dim > 0 else None
         if cond_dim > 0:
-            # zero-init scalar gate per injection point (input + one after each block).
-            # Starts the model as the unconditional one and learns, per point, how much
-            # conditioning to admit (ReZero/LayerScale/adaLN-zero style). The time bias
-            # is NOT gated -- the noise level needs full-strength access at every layer.
+            # zero-init per-injection-point gate: starts unconditional, learns the dose
             self.cond_gate = nn.Parameter(torch.zeros(n_layers + 1))
-        self.blocks = nn.ModuleList(
+            self.blocks = nn.ModuleList(
             TransformerBlock(hidden_dim, n_heads, dropout) for _ in range(n_layers)
         )
         self.ln_out = nn.LayerNorm(hidden_dim)
-        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False) # weight matrix for output projection to symmetric matrix: out = h W h^T
+        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)  # output projection: out = h W h^T
 
     def forward(self, x, t, cond=None, cond_mask=None):
         h = self.embed(x) + self.pos
@@ -61,8 +54,6 @@ class LogCovScoreGNN(nn.Module):
             cond_bias = self.cond_embedding(cond, cond_mask=cond_mask,
                                             batch_size=x.shape[0])[:, None]   # (B, 1, d)
 
-        # injection point 0 (input), then one after each block. cond enters through a
-        # zero-init per-point gate, so the model starts unconditional and learns the dose.
         h = h + t_bias
         if cond_bias is not None:
             h = h + self.cond_gate[0] * cond_bias

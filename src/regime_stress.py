@@ -1,32 +1,13 @@
 """Regime-conditional portfolio stress test (application, simulated DGP).
 
-The use-case: an investor holds a fixed portfolio w and wants to know how its risk
-behaves in a volatility regime that is too rare to estimate from data. A generative
-model can answer this: conditioned on the regime, it produces a *distribution* of
-plausible covariances, hence a distribution of portfolio risk w'Σw. A point
-estimator (Ledoit-Wolf, sample covariance) gives only a single number and cannot.
+For a fixed portfolio w and each trailing-vol regime (low/mid/high tertile), compare
+the distribution of annualised portfolio vol sqrt(w'Σw) across estimators: True (DGP
+H_t), SGCM (conditional model), SGM (unconditional, regime-blind), Sample and LW
+(rolling trailing covariances). Point estimators give one number per date; the
+generative models give a whole distribution, which is the point.
 
-For a fixed w and each trailing-vol regime (low/mid/high tertile) we compare the
-distribution of annualised portfolio volatility sqrt(w'Σw):
-  * True  -- the true H_t in that regime (DGP ground truth; only available because
-             the data is simulated, which is the whole point).
-  * SGCM  -- conditional model, sampled at that regime's conditioning value.
-  * SGM   -- unconditional model: one regime-blind distribution, the SAME for every
-             regime, so it cannot track the regime.
-  * Sample-- rolling trailing sample covariance at the regime's indices (the
-             unshrunk baseline LW improves on; a point per date).
-  * LW    -- rolling Ledoit-Wolf at the regime's validation indices (a point per
-             date; implicitly regime-adaptive through its trailing window).
-
-Metrics per regime: median, 95th- and 99th-percentile (stress) portfolio vol, and
-the Wasserstein-1 distance of each estimator's risk distribution to True. The 95th/
-99th percentiles are the 5%/1% tail stress levels (in vol units; under a Gaussian
-return model they map to 5%/1% VaR via VaR_a = z_a * vol). The high/low risk ratio
-is reported separately as a scale-robust summary (it cancels the model's overall
-scale bias, isolating the regime structure).
-
-Reuses the trained simulated checkpoints from the part-1 run -- no new training.
-"""
+Metrics per regime: median, 95th/99th-percentile (stress) vol, and W1 to True. The
+high/low ratio is a scale-robust summary. Reuses the part-1 checkpoints, no training."""
 
 from __future__ import annotations
 
@@ -69,12 +50,9 @@ def _ckpt_path(seed, cond_dim):
     return ROOT / "checkpoints" / f"logcov_score_sim_cov{ctag}_seed{seed}.pt"
 
 
-# =============================================================================
-# Portfolio risk + distribution metrics (pure, testable without a model)
-# =============================================================================
+# --- Portfolio risk + distribution metrics -----------------------------------
 def portfolio_vol(Sigma, w):
-    """Annualised portfolio volatility sqrt(w'Σw) for a covariance batch.
-    Sigma: (B, N, N) tensor; w: (N,) tensor -> (B,) numpy array."""
+    """Annualised portfolio volatility sqrt(w'Σw). Sigma: (B, N, N); w: (N,) -> (B,)."""
     var = torch.einsum("i,bij,j->b", w, Sigma, w).clamp_min(0.0)
     return (var.sqrt().numpy()) * ANN
 
@@ -97,12 +75,9 @@ def dist_metrics(vols, true_vols):
     }
 
 
-# =============================================================================
-# Model generation per regime
-# =============================================================================
+# --- Model generation per regime ----------------------------------------------
 def load_score_model(ckpt_path, n_assets, device):
-    """Build LogCovScoreGNN from a checkpoint's saved cfg and install its EMA weights
-    (the weights used for sampling in training). Returns (model, cfg)."""
+    """Build LogCovScoreGNN from a checkpoint's cfg and install its EMA weights."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["cfg"]
     model = LogCovScoreGNN(
@@ -115,7 +90,7 @@ def load_score_model(ckpt_path, n_assets, device):
     ).to(device)
     model.load_state_dict(ckpt["model"])
     ema = ckpt.get("ema")
-    if ema is not None:                                  # swap in the EMA shadow
+    if ema is not None:                                  # swap in EMA shadow
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if n in ema:
@@ -125,8 +100,7 @@ def load_score_model(ckpt_path, n_assets, device):
 
 
 def _sample_cov(model, sde, cond_norm, n_assets, n_total, norm, device, eps_t):
-    """Draw `n_total` covariances at a FIXED cond (or None = unconditional), in
-    chunks; returns a CPU tensor (n_total, N, N)."""
+    """Draw `n_total` covariances at a fixed cond (or None), chunked. CPU tensor."""
     out, drawn = [], 0
     while drawn < n_total:
         b = min(GEN_CHUNK, n_total - drawn)
@@ -141,9 +115,8 @@ def _sample_cov(model, sde, cond_norm, n_assets, n_total, norm, device, eps_t):
 
 
 def _sample_cov_varcond(model, sde, cond_batch, n_assets, norm, device, eps_t):
-    """Draw one covariance per (varying) normalised cond row in cond_batch
-    (n, cond_dim), so the regime's own conditioning spread enters the risk
-    distribution (not just the model's stochasticity at a single cond). CPU tensor."""
+    """Draw one covariance per normalised cond row in cond_batch (n, cond_dim), so
+    the regime's own conditioning spread enters the risk distribution. CPU tensor."""
     out, drawn, n_total = [], 0, cond_batch.shape[0]
     while drawn < n_total:
         b = min(GEN_CHUNK, n_total - drawn)
@@ -157,12 +130,9 @@ def _sample_cov_varcond(model, sde, cond_batch, n_assets, norm, device, eps_t):
 
 def model_regime_vols(ckpt_path, w, cond_samples, n_assets, norm, device):
     """Per-regime annualised portfolio-vol samples for one trained model.
-
-    cond_samples: list (len = #regimes) of (N_PER_REGIME, cond_dim) NORMALISED cond
-      batches sampled from each bin's empirical cond distribution, or None for the
-      unconditional model. Conditional: draw one Σ per cond row (the bin's full
-      conditioning spread). Unconditional: draw one N_POOL pool, reuse every bin
-      (regime-blind). Returns list of (n,) vol arrays, one per regime."""
+    cond_samples: per-regime normalised cond batches, or None (unconditional). The
+    conditional model draws one Σ per cond row; the unconditional model draws one
+    pool reused for every bin. Returns a list of (n,) vol arrays, one per regime."""
     sde = VPSDE(N=SDE_STEPS)
     model, cfg = load_score_model(ckpt_path, n_assets, device)
     use_cond = cfg.get("cond_dim", 0) > 0 and cond_samples is not None
@@ -177,9 +147,7 @@ def model_regime_vols(ckpt_path, w, cond_samples, n_assets, norm, device):
             for cond_b in cond_samples]
 
 
-# =============================================================================
-# Runner
-# =============================================================================
+# --- Runner --------------------------------------------------------------------
 def aggregate_runs(runs):
     """list of metric dicts -> {metric: (mean, std)} over shared keys."""
     if not runs:

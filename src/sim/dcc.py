@@ -12,10 +12,7 @@ _OUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 N_SIM_STEPS = 50_000
 df = build_returns(DEFAULT_INDUSTRIES, DEFAULT_FACTORS, start="1969-07-01", end="2026-02-27")
 
-# DCC-GARCH Fitting
-
-# Univariate fitting to each series
-# AR(1)-GARCH(1,1) with Student's t innovations
+# AR(1)-GARCH(1,1) with Student's t innovations, fit per series
 def fit_univariate(df, const_mean=("Guns",)):
     Z, results = {}, {}
     for col in df.columns:
@@ -29,8 +26,7 @@ def fit_univariate(df, const_mean=("Guns",)):
     return pd.DataFrame(Z).dropna(), results
 
 
-# DCC fitting to standardized resduals obtained
-# Constant Conditional Correlation Estimate
+# constant conditional correlation from standardized residuals
 def constant_corr(Z):
     v = Z.values
     Q_ = v.T @ v / len(v)
@@ -38,19 +34,8 @@ def constant_corr(Z):
     R_ = Q_ / np.outer(d, d)
     return R_, Q_, v
 
-# DCC
-def dyn_corr(Qbar, v, alpha, beta):
-    T, N = v.shape
-    Q = Qbar.copy()
-    R = np.empty((T, N, N))
-    for t in range(T):
-        d = np.sqrt(np.diag(Q))
-        R[t] = Q / np.outer(d, d)
-        outer = np.outer(v[t], v[t])
-        Q = Qbar + alpha * (outer - Qbar) + beta * (Q - Qbar)
-    return R
 
-# MLE DCC: Gaussian second-stage QML for (alpha, beta) on standardized residuals
+# Gaussian second-stage QML for (alpha, beta)
 def dcc_negloglik(params, Qbar, v):
     alpha, beta = params
     if alpha < 0 or beta < 0 or alpha + beta >= 1:
@@ -79,7 +64,7 @@ def fit_dcc(Qbar, v, x0=(0.02, 0.97)):
     return minimize(dcc_negloglik, x0, args=(Qbar, v), method="SLSQP",
                     bounds=bounds, constraints=cons, options={"ftol": 1e-8})
 
-# Simulating from DCC-GARCH
+
 def _extract_params(results):
     cols = list(results.keys())
     N = len(cols)

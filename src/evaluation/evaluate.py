@@ -1,12 +1,8 @@
-"""Compare real vs generated correlation/covariance matrices.
-
-Correlation stylized facts (CorrGAN-style, Marti et al.): mean off-diagonal
-correlation, Gini of the eigenvalue spectrum, cophenetic correlation (single +
-ward linkage), Perron–Frobenius violation (negative mass of the leading
-eigenvector), and the power-law exponent of the eigenvalue distribution — each
-scored by Wasserstein-1 against a fixed real (val) reference. Covariance adds a
-variance-scale W1. The irreducible floor is no longer a split-half of the val set:
-it is the True (DGP oracle) row of the distributional-fidelity table."""
+"""Compare real vs generated correlation/covariance matrices via CorrGAN-style
+stylized facts (Marti et al.): mean off-diagonal correlation, eigenvalue Gini,
+cophenetic correlation (single/ward), Perron-Frobenius violation, and the
+eigenvalue power-law exponent, each scored by Wasserstein-1 against the val
+reference. Covariance adds a variance-scale W1."""
 
 import numpy as np
 import torch
@@ -32,9 +28,7 @@ def to_correlation(Sigma):
 
 
 def logcov_to_covariance(S):
-    """Symmetric matrix-log S (N x N) -> covariance Sigma = expm(S) via the
-    eigendecomposition: expm(Q diag(w) Q^T) = Q diag(exp w) Q^T. expm maps any
-    symmetric matrix to an SPD one, so the reconstruction is unconstrained."""
+    """Matrix-log S -> covariance Sigma = expm(S) = Q diag(exp w) Q^T (always SPD)."""
     w, Q = torch.linalg.eigh(S)
     return (Q * w.exp().unsqueeze(-2)) @ Q.transpose(-1, -2)
 
@@ -75,9 +69,8 @@ def cophenetic_per_sample(C, method="single"):
 
 
 def _leading_eigvec_neg_sum(C_np):
-    """Perron–Frobenius violation: -sum of the negative entries of the leading
-    eigenvector (sign-normalised so its entries sum positive). ~0 for a 'clean'
-    correlation matrix whose top eigenvector is all-positive. Returns (T,) >= 0."""
+    """Perron-Frobenius violation: -sum of negative entries of the (sign-normalised)
+    leading eigenvector. ~0 when the top eigenvector is all-positive. Returns (T,)."""
     out = np.empty(len(C_np))
     for i in range(len(C_np)):
         _, V = np.linalg.eigh(C_np[i])      # ascending -> last column = leading
@@ -122,8 +115,7 @@ def _subsample(C, k, seed=0):
     return C[torch.randperm(len(C), generator=g)[:k]]
 
 
-# CorrGAN-style per-matrix stylized facts, computed on <= FACT_SUBSAMPLE matrices
-# (powerlaw.Fit is the bottleneck; 1000 is plenty for stable mean/std/W1).
+# per-matrix facts computed on <= FACT_SUBSAMPLE matrices (powerlaw.Fit is the bottleneck)
 FACT_NAMES = ["gini", "coph_single", "coph_ward", "perron", "powerlaw"]
 FACT_SUBSAMPLE = 1000
 
@@ -142,16 +134,10 @@ def _per_matrix_facts(C):
 
 
 def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None):
-    """Variance-space (scale) fidelity — the dimension correlation metrics discard.
-    Wasserstein-1 on the pooled distribution of per-asset variances (diagonals of Σ).
-    The irreducible floor lives in the True (DGP oracle) row of the distributional-
-    fidelity table, so this no longer computes a split-half floor.
-
-    Sigma_real, Sigma_gen: (T, N, N) covariance batches (not correlation).
-    Sigma_train (optional): the train-split covariances. When given, the same
-    variance stats are reported for train, plus gen-vs-train W1 — to disentangle
-    exp-tail reconstruction bias (gen overshoots BOTH train and val) from
-    train/val regime shift (gen tracks train; both differ from val)."""
+    """Scale fidelity: W1 on the pooled per-asset variances (diagonals of Sigma),
+    plus mean/median levels. When Sigma_train is given, also reports train stats and
+    gen-vs-train W1, to separate reconstruction bias from train/val regime shift.
+    All inputs are (T, N, N) covariance batches."""
     var_real = torch.diagonal(Sigma_real, dim1=-2, dim2=-1).flatten().numpy()
     var_gen  = torch.diagonal(Sigma_gen,  dim1=-2, dim2=-1).flatten().numpy()
 
@@ -166,8 +152,6 @@ def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None):
 
     if Sigma_train is not None:
         var_train = torch.diagonal(Sigma_train, dim1=-2, dim2=-1).flatten().numpy()
-        # gen-vs-train W1: if this is ~floor while w1_variance (val) is >>floor,
-        # the scale gap is regime shift, not the model.
         out.update({
             "var_mean_train":    float(var_train.mean()),
             "var_median_train":  float(np.median(var_train)),
@@ -197,31 +181,16 @@ def _var_pooled(Sigma):
 def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
                        bin_labels=("lo", "mid", "hi")):
     """Conditional-fidelity eval. Bin the trailing-vol regime by quantiles of
-    `cond_real`; within each bin compare real vs generated correlation (pooled
-    off-diagonal) and scale (pooled variance) via W1. This is the test conditioning
-    is *for* -- the marginal eval averages over regimes and hides it.
+    `cond_real`; within each bin compare real vs generated off-diagonal correlation
+    and per-asset variance via W1.
 
-    cond_real: (T,) regime value aligned with Sigma_real (the val set, raw space).
-    cond_gen:  (n,) regime value each generated matrix was drawn at (conditional
-               model). If None (unconditional), the whole generated set is compared
-               to every bin -- a marginal generator cannot match per-regime, which
-               is exactly what this surfaces.
+    cond_real: (T,) regime value aligned with Sigma_real (val, raw space).
+    cond_gen:  (n,) regime value each generated matrix was drawn at. If None
+               (unconditional), the whole generated set is compared to every bin --
+               a marginal generator cannot match per-regime, which this surfaces.
 
-    Notes on the comparison being made (state these in the paper):
-      * CDM (cond_gen given): bin-vs-bin -- generated-conditioned-on-bin-k vs
-        real-in-bin-k. This is conditional fidelity.
-      * DM (cond_gen None): full-marginal-vs-bin -- the *entire* generated set vs
-        real-in-bin-k. This is the right baseline (a regime-blind model judged
-        against each regime), NOT "DM restricted to bin k". The DM per-bin W1 is
-        therefore a marginal-vs-conditional distance, by construction >= a model
-        that tracks the regime.
-      * regime_pooled_*: the no-binning row (all real vs all gen), computed by the
-        SAME machinery as the bins so it sits apples-to-apples atop the lo/mid/hi
-        rows -- 'overall' vs per-regime.
-
-    No floor is computed here: the split-half floor was dropped in favour of the
-    True (DGP oracle) row of the distributional-fidelity table.
-    """
+    So cond_gen given -> bin-vs-bin (conditional fidelity); cond_gen None ->
+    full-marginal-vs-bin. regime_pooled_* is the no-binning row, same machinery."""
     cond_real = _np1d(cond_real)
     edges = np.quantile(cond_real, np.linspace(0, 1, len(bin_labels) + 1))
     edges[0], edges[-1] = -np.inf, np.inf
@@ -230,8 +199,7 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
     def block(Sr_full, Sg_full, pre):
         """One real-vs-gen W1 comparison, shared by the pooled row and every bin."""
         Sr = _subsample(Sr_full, FACT_SUBSAMPLE)
-        # degenerate (non-positive diagonal) gen count -- 0 for expm covariances,
-        # but surfaced so a high-vol-bin sample-dropping bias would be visible.
+        # count degenerate (non-positive diagonal) gen matrices; ~0 for expm covariances
         d = torch.diagonal(Sg_full, dim1=-2, dim2=-1)
         n_invalid = int((~(d > 1e-6).all(dim=-1)).sum().item())
         Sg = _subsample(Sg_full, FACT_SUBSAMPLE)
@@ -248,7 +216,7 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
         return res
 
     out = {}
-    # pooled row: no binning, all real vs all gen, identical machinery to the bins.
+    # pooled row: no binning, all real vs all gen
     out.update(block(Sigma_real, Sigma_gen, "regime_pooled_"))
     for k, label in enumerate(bin_labels):
         rmask = torch.from_numpy((cond_real >= edges[k]) & (cond_real < edges[k + 1]))
@@ -263,11 +231,9 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
 
 
 def fact_means(C):
-    """Mean stylized-fact VALUES over a correlation batch (for the values table:
-    simulated train/val reference rows and the LW row). Off-diagonal correlation
-    is the mean over the full pooled off-diagonal; the per-matrix facts are meaned
-    over a FACT_SUBSAMPLE-sized subsample (matching eval_and_plot). Returns
-    {offdiag_mean, gini_mean, coph_single_mean, coph_ward_mean, perron_mean, powerlaw_mean}."""
+    """Mean stylized-fact values over a correlation batch (for the reference/LW
+    rows): pooled off-diagonal mean plus each per-matrix fact meaned over a
+    FACT_SUBSAMPLE subsample. -> {offdiag_mean, gini_mean, ...}."""
     f = _per_matrix_facts(_subsample(C, FACT_SUBSAMPLE))
     out = {"offdiag_mean": float(_offdiag(C).flatten().mean())}
     for n in FACT_NAMES:
@@ -276,12 +242,9 @@ def fact_means(C):
 
 
 def ledoit_wolf(X):
-    """Ledoit-Wolf (2004) scaled-identity shrinkage covariance from observations
-    X (n_obs, N). Shrinks the sample covariance S toward mu*I (mu = mean variance)
-    by the optimal intensity that minimises expected Frobenius loss. The shrinkage
-    constant uses the closed-form b^2 = (sum_t ||x_t||^4 - n||S||^2)/(n^2 N), which
-    is the vectorised identity for (1/n^2) sum_t ||x_t x_t^T - S||_F^2 -- so there
-    is no per-observation loop."""
+    """Ledoit-Wolf (2004) scaled-identity shrinkage covariance from X (n_obs, N):
+    shrinks the sample covariance toward mu*I by the optimal Frobenius-loss
+    intensity, using the closed-form (vectorised) shrinkage constant."""
     X = np.asarray(X, dtype=np.float64)
     n, N = X.shape
     X = X - X.mean(0, keepdims=True)
@@ -296,11 +259,9 @@ def ledoit_wolf(X):
 
 
 def rolling_lw_covariances(returns, idx, window):
-    """Strictly-causal trailing Ledoit-Wolf covariance at each index in `idx`.
-    For each t in idx with a full trailing window, estimate LW cov from
-    returns[t-window:t] (excludes t, so it is causal and never sees H_t). Indices
-    with t < window are dropped. returns: (T, N); idx: 1-D int array.
-    -> (m, N, N) float32 covariance tensor, plus the kept indices."""
+    """Strictly-causal trailing Ledoit-Wolf covariance at each t in `idx`, from
+    returns[t-window:t] (excludes t; t < window dropped).
+    -> (m, N, N) float32 tensor, plus the kept indices."""
     returns = np.asarray(returns)
     idx = np.asarray(idx)
     keep = idx[idx >= window]
@@ -311,11 +272,9 @@ def rolling_lw_covariances(returns, idx, window):
 
 
 def rolling_sample_covariances(returns, idx, window):
-    """Strictly-causal trailing *sample* covariance at each index in `idx` -- the
-    unshrunk counterpart of rolling_lw_covariances, sharing its causal convention
-    (returns[t-window:t], excludes t, t<window dropped). The classic baseline that
-    Ledoit-Wolf shrinkage is meant to improve on out-of-sample.
-    returns: (T, N); idx: 1-D int array. -> (m, N, N) float32, plus kept indices."""
+    """Strictly-causal trailing *sample* covariance -- the unshrunk counterpart of
+    rolling_lw_covariances, sharing its causal convention (returns[t-window:t]).
+    -> (m, N, N) float32, plus kept indices."""
     returns = np.asarray(returns, dtype=np.float64)
     idx = np.asarray(idx)
     keep = idx[idx >= window]
@@ -334,20 +293,10 @@ def _normalize_cov_np(M):
 
 
 def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
-    """Heatmap grid (viridis) for a visual plausibility check: n real vs n generated
-    matrices, showing whether generated matrices reproduce block/sector structure.
-
-    Layout: rows are real (top) / generated (bottom); columns are grouped, with
-    `show_cov` (covariance target) giving two side-by-side groups -- covariance and
-    the correlation of the SAME sampled matrices -- since the model produces both at
-    once, so each matrix is shown on both scales. Otherwise only the correlation
-    group is drawn. Each group has its own horizontal colorbar.
-
-    Covariance rows use a *sequential* 0->vmax scale with gamma compression:
-    covariance entries are almost all positive, so a symmetric diverging map wastes
-    half its range; PowerNorm(gamma<1) expands the low end so off-diagonal structure
-    shows while high-variance entries saturate (vmax = robust 99th percentile of the
-    displayed real covariances). Correlation rows use a fixed [-1, 1] linear scale."""
+    """Heatmap grid: n real (top) vs n generated (bottom) matrices. With show_cov,
+    two column groups (covariance + correlation of the same samples); otherwise just
+    correlation. Covariance uses a sequential PowerNorm(gamma=0.5) up to the real
+    99th-percentile; correlation uses a fixed [-1, 1] scale."""
     rng = np.random.default_rng(seed)
     n = min(n, len(real), len(gen))
     ridx = rng.choice(len(real), size=n, replace=False)
@@ -389,9 +338,7 @@ def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
 
 
 def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
-    """Per-run diagnostic plot + marginal W1 stats (gen vs the val reference). The
-    irreducible floor is no longer computed here -- it lives in the True (DGP
-    oracle) row of the distributional-fidelity table."""
+    """Per-run diagnostic plot + marginal W1 stats (gen vs the val reference)."""
     if n_inv_gen:
         print(f"  [eval] {n_inv_gen} generated samples were dropped (degenerate)")
 

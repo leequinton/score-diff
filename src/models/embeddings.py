@@ -16,16 +16,9 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 class CondEmbedding(nn.Module):
-    """Maps a continuous conditioning vector to a hidden-dim bias, with a learned
-    null token enabling classifier-free guidance (Ho and Salimans, 2022).
-
-    Modes:
-      cond=None                          → broadcast null embedding (unconditional)
-      cond=(B, cond_dim), cond_mask=None → fully conditional
-      cond=(B, cond_dim), cond_mask=(B,) → masked: True entries use null (CFG dropout)
-
-    Returns a (B, hidden_dim) bias to be folded into the time bias.
-    """
+    """Conditioning vector -> (B, hidden_dim) bias, with a learned null token for
+    classifier-free guidance (Ho and Salimans, 2022). cond=None or masked entries
+    use the null embedding; the mask implements CFG dropout."""
 
     def __init__(self, cond_dim, hidden_dim):
         super().__init__()

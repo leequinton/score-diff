@@ -19,21 +19,14 @@ DEFAULT_INDUSTRIES = os.path.join(_DATA_DIR, "raw", "49_Industry_Portfolios_Dail
 DEFAULT_FACTORS = os.path.join(_DATA_DIR, "raw", "F-F_Research_Data_5_Factors_2x3_daily.csv")
 
 
-# --------------------------------------------------------------------------- #
-# Build a clean, balanced return panel
-# --------------------------------------------------------------------------- #
 def build_returns(industries_path, factors_path, start=None, end=None):
-    """Return a clean, balanced panel of daily industry returns (in percent).
-
-    Aligns industries to the factor trading calendar, restricts to the period
-    over which every selected industry has data (so GARCH fits are not
-    contaminated by leading NaNs from the early sample), and drops residual
-    holiday gaps.
-    """
+    """Clean, balanced panel of daily industry returns (percent): aligned to the
+    factor calendar, restricted to the period where every industry has data, with
+    residual NaN rows dropped."""
     ind = load_daily(industries_path)
     fac = load_daily(factors_path)
 
-    # Align to the common trading calendar shared with the factor file.
+    # align to the factor file's trading calendar
     common = ind.index.intersection(fac.index)
     ind = ind.loc[common]
 
@@ -42,8 +35,7 @@ def build_returns(industries_path, factors_path, start=None, end=None):
     if end is not None:
         ind = ind.loc[ind.index <= pd.Timestamp(end)]
 
-    # Balance the panel: start at the latest "first valid" date across columns
-    # so every series is present, then drop any residual NaN rows.
+    # balance: start at the latest first-valid date across columns, drop residual NaN rows
     first_valid = ind.apply(lambda s: s.first_valid_index()).max()
     ind = ind.loc[ind.index >= first_valid]
     n_before = len(ind)
@@ -53,26 +45,10 @@ def build_returns(industries_path, factors_path, start=None, end=None):
     return ind
 
 
-# --------------------------------------------------------------------------- #
-# Stationarity / GARCH-suitability diagnostics
-# --------------------------------------------------------------------------- #
 def stationarity_report(returns, alpha=0.05, lb_lags=10, arch_lags=12):
-    """Per-series diagnostics relevant to DCC-GARCH calibration.
-
-    Tests, and what we want for a series we can confidently model:
-      * ADF   (H0: unit root / non-stationary)  -> reject  (p < alpha)
-      * KPSS  (H0: stationary)                   -> fail to reject (p > alpha)
-      * Ljung-Box on returns (H0: no serial corr in mean)
-            -> guides whether a constant mean suffices or an AR term is needed
-      * ARCH-LM (Engle, H0: no ARCH effects)     -> reject  (p < alpha)
-            -> conditional heteroskedasticity present, so GARCH is justified
-      * Jarque-Bera (H0: normal)                 -> typically reject
-            -> motivates a fat-tailed (Student-t) innovation distribution
-
-    Returns a DataFrame, one row per series, with a boolean ``ok`` column that
-    is True when the series is stationary by both ADF and KPSS and shows ARCH
-    effects.
-    """
+    """Per-series DCC-GARCH suitability diagnostics: ADF + KPSS (stationarity),
+    Ljung-Box (mean autocorr), Engle ARCH-LM (vol clustering), Jarque-Bera
+    (normality). Returns a DataFrame with an ``ok`` flag (stationary + has ARCH)."""
     rows = {}
     for col in returns.columns:
         raw = returns[col].dropna()
@@ -96,7 +72,6 @@ def stationarity_report(returns, alpha=0.05, lb_lags=10, arch_lags=12):
         stationary = (adf_p < alpha) and (kpss_p > alpha)
         has_arch = arch_lm_p < alpha
         rows[col] = {
-            # descriptive moments (on raw, undemeaned series)
             "n": int(raw.shape[0]),
             "mean": float(raw.mean()),
             "std": float(raw.std()),
@@ -104,20 +79,16 @@ def stationarity_report(returns, alpha=0.05, lb_lags=10, arch_lags=12):
             "max": float(raw.max()),
             "skew": float(stats.skew(raw)),
             "exkurt": float(stats.kurtosis(raw)),  # excess kurtosis (Fisher)
-            # ADF: H0 unit root -> stat below 5% crit / p<alpha rejects
             "adf_stat": adf_stat,
             "adf_p": adf_p,
             "adf_5pct": adf_crit["5%"],
-            # KPSS: H0 stationary -> stat below 5% crit / p>alpha keeps H0
             "kpss_stat": kpss_stat,
             "kpss_p": kpss_p,
             "kpss_5pct": kpss_crit["5%"],
-            # Ljung-Box (mean autocorr) and Engle ARCH-LM (vol clustering)
             "lb_stat": lb_stat,
             "lb_p": lb_p,
             "arch_stat": arch_lm,
             "arch_p": arch_lm_p,
-            # Jarque-Bera normality
             "jb_stat": jb_stat,
             "jb_p": jb_p,
             "stationary": stationary,

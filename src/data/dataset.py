@@ -1,18 +1,8 @@
-"""Log-covariance baseline dataset.
-
-Loads empirical correlation/covariance matrices, takes their matrix logarithm
-S = logm(Sigma) = Q diag(log lambda) Q^T (a single symmetric matrix obtained via
-the eigendecomposition), normalizes per-entry on the train split, and does a
-temporal train/val split with an optional gap so the two never share underlying
-observations. Optionally loads and normalizes a per-window conditioning variable
-(e.g. trailing market volatility); when `cond_path` is None the setup is fully
-unconditional.
-
-Working in the matrix-log (log-Euclidean) space makes the target unconstrained
-(any symmetric matrix is a valid logm), permutation-equivariant, and linear in
-the eigenvalue/scale direction. The eigendecomposition is pure preprocessing, so
-no gradient ever passes through it.
-"""
+"""Log-covariance baseline dataset. Loads correlation/covariance matrices, takes
+the matrix log S = logm(Sigma), normalizes per-entry on the train split, and does
+a temporal train/val split with an optional gap. Optionally loads a per-window
+conditioning variable (e.g. trailing market vol). The matrix log makes the target
+unconstrained; the eigendecomposition is pure preprocessing (no gradient)."""
 
 import torch
 from torch.utils.data import Dataset
@@ -73,27 +63,17 @@ class SymNormalizer:
 
 
 def _logm(M, eig_floor=1e-8):
-    """Symmetric matrix logarithm via eigendecomposition: logm(Q diag(w) Q^T)
-    = Q diag(log w) Q^T. The eigenvector ambiguity cancels on reassembly, so the
-    result is a smooth single-valued function of M even at repeated eigenvalues."""
+    """Symmetric matrix log via eigendecomposition: Q diag(log w) Q^T."""
     w, Q = torch.linalg.eigh(M)
     log_w = w.clamp_min(eig_floor).log()
     return (Q * log_w.unsqueeze(-2)) @ Q.transpose(-1, -2)
 
 
 def _split_indices(T, val_frac, gap, split, n_val_blocks):
-    """Train/val index arrays for either split type.
-
-    "contiguous": train = first (1-val_frac), val = last val_frac, one `gap` seam.
-        On a nonstationary path this puts train and val in different regimes.
-    "blocked": scatter `n_val_blocks` equal val blocks evenly across [0, T) and
-        embargo `gap` steps on each side of every block (removed from train). Both
-        train and val then span the whole timeline, so their marginals match -- the
-        correct setup for a distributional-fidelity claim -- while the embargo keeps
-        every val sample >= gap from any train sample, so val still detects
-        memorisation on the autocorrelated path.
-
-    Returns (train_idx, val_idx) as 1-D long tensors."""
+    """Train/val index tensors. "contiguous": train first (1-val_frac), val last
+    val_frac, one `gap` seam. "blocked": scatter `n_val_blocks` equal val blocks
+    across [0, T) with a `gap` embargo each side, so train/val share the regime
+    mixture while every val sample stays >= gap from any train sample."""
     if split == "contiguous":
         n_val = int(T * val_frac)
         n_train = T - n_val - gap
@@ -114,9 +94,7 @@ def _split_indices(T, val_frac, gap, split, n_val_blocks):
             embargo[max(0, start - gap):min(T, end + gap)] = True
         train_idx = torch.nonzero(~embargo, as_tuple=False).squeeze(-1)
         val_idx = torch.nonzero(val_mask, as_tuple=False).squeeze(-1)
-        # feasibility: each block costs ~(vbl + 2*gap); when n_val_blocks*(vbl+2*gap)
-        # approaches T the embargo zones merge and starve train. Fail loudly instead
-        # of returning a near-empty (or empty) split.
+        # embargo zones ~n_val_blocks*(vbl+2*gap) can starve train; fail loudly
         if len(train_idx) < len(val_idx) or len(val_idx) < n_val_blocks:
             raise ValueError(
                 f"blocked split starved: train={len(train_idx)}, val={len(val_idx)} "
@@ -130,14 +108,10 @@ def _split_indices(T, val_frac, gap, split, n_val_blocks):
 
 def make_logcov_datasets(C_path, val_frac=0.2, ridge=1e-3, gap=0, cond_path=None,
                          target="correlation", split="contiguous", n_val_blocks=10):
-    """Load empirical matrices, take the matrix log, normalize, split. Empirical
-    matrices with T_obs ~ N are often near-rank-deficient; a small ridge keeps
-    every eigenvalue strictly positive so the matrix log is finite. `target`
-    controls the shrinkage target:
-      "correlation" -> ridge toward identity (preserves unit diagonal)
-      "covariance"  -> ridge toward own diagonal (preserves per-asset scale)
-    If `cond_path` is provided, a per-window conditioning vector is loaded and
-    normalized on the train split."""
+    """Load matrices, apply a small ridge (keeps eigenvalues positive for logm),
+    take the matrix log, normalize, split. `target` picks the shrinkage target:
+    "correlation" -> identity, "covariance" -> own diagonal (keeps per-asset
+    scale). If `cond_path` is given, a conditioning vector is normalized on train."""
     M = torch.load(C_path, weights_only=True).float()  # (T, N, N)
     N = M.shape[-1]
     if target == "correlation":
@@ -169,8 +143,7 @@ def make_logcov_datasets(C_path, val_frac=0.2, ridge=1e-3, gap=0, cond_path=None
         norm.normalize(S_va),
         cond=(norm.normalize_cond(cond_va) if cond_va is not None else None),
     )
-    # expose the source-tensor indices so the eval can recover the matching raw
-    # covariances/correlations (a tail-slice no longer works once val is scattered).
+    # source-tensor indices so the eval can gather the matching raw matrices
     train_ds.idx = train_idx
     val_ds.idx = val_idx
     return train_ds, val_ds, norm

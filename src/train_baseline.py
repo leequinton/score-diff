@@ -25,14 +25,10 @@ from src.train_utils import EMA, cycle, plot_losses
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# --- data source -------------------------------------------------------------
-# "empirical" : rolling-window matrices from the FF industry data
-# "sim"       : the calibrated DCC-GARCH covariance path (src/sim/dcc.py -> prepare_sim)
+# "empirical": rolling-window FF matrices; "sim": the DCC-GARCH covariance path
 SOURCE = "sim"
 
-# "correlation" diffuses the matrix log of correlation matrices (the standard baseline)
-# "covariance" diffuses the matrix log of covariance matrices, capturing per-asset scale.
-# GMVP needs the scales + Sigma^-1, so the portfolio application uses "covariance".
+# "covariance" keeps per-asset scale (needed for GMVP); "correlation" is the standard baseline
 TARGET = "covariance"
 
 if SOURCE == "empirical":
@@ -40,22 +36,15 @@ if SOURCE == "empirical":
     GAP    = 12
     COR_FILE, COV_FILE, COND_FILE = "C_empirical_daily", "Cov_empirical_daily", "cond_daily"
 elif SOURCE == "sim":
-    # one long, highly autocorrelated path -> bigger train/val gap. cond_sim is the
-    # causal trailing market vol from prepare_sim (set cond_dim=0 below to ignore it).
-    # GAP=500 exceeds the path's empirical decorrelation length: the ACF of realized
-    # variance / top eigenvalue falls below 0.05 by ~460 steps, so a 500-step embargo
-    # makes train and val effectively independent at each block seam (300 left ~0.2).
+    # one long autocorrelated path -> large embargo; GAP=500 exceeds its ACF decorrelation length
     SUFFIX = "_sim"
     GAP    = 500
     COR_FILE, COV_FILE, COND_FILE = "C_sim", "Cov_sim", "cond_sim"
 else:
     raise ValueError(f"unknown SOURCE {SOURCE!r}")
 
-# train/val split. "blocked" scatters N_VAL_BLOCKS val blocks across the path with a
-# `gap` embargo each side, so train and val share the same regime mixture -- the right
-# eval for a distributional-fidelity claim (vs "contiguous", which tests regime
-# extrapolation). NOTE the embargo cost: each block discards ~2*GAP steps from train,
-# so with many blocks reduce GAP (ACF-justified) or N_VAL_BLOCKS to avoid starving train.
+# "blocked" scatters val blocks with a gap embargo so train/val share the regime
+# mixture (vs "contiguous", which tests extrapolation)
 SPLIT        = "blocked"
 N_VAL_BLOCKS = 10
 
@@ -97,23 +86,19 @@ CFG = dict(
     n_samples=3000,        # ~1000 per regime bin (3 bins)
     eps_t=1e-3,
     seed=42,
-    cond_dim=1,  # sim: trailing market vol (1-D). empirical: [equity vol, rate vol]. 
+    cond_dim=1,  # sim: trailing market vol (1-D)
     cond_dropout=0.1,
     guidance_scale=0.0,
 )
 
-# multi-seed sweep: run every (variant, seed) and report mean +- std across seeds.
-# SGM  = unconditional score-based generative model (no regime conditioning).
-# SGCM = conditional score-based generative model (trailing-vol conditioning).
+# multi-seed sweep, reported mean +- std. SGM = unconditional, SGCM = trailing-vol conditional.
 SEEDS = (0, 1, 2, 3, 4)
 VARIANTS = {
     "SGM":  {"cond_dim": 0},
     "SGCM": {"cond_dim": 1},
 }
 
-# Ledoit-Wolf baseline: trailing window (steps) for the rolling OOS covariance
-# estimate. 252 ~ one trading year; window/N ~ 5 at N=49, a realistic estimation
-# horizon rather than a rigged one.
+# Ledoit-Wolf baseline: trailing window (~1 trading year) for the rolling OOS estimate
 LW_WINDOW = 252
 
 
@@ -141,12 +126,8 @@ def main(cfg=CFG):
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"])
 
-    # Training schedule is specified directly in optimizer steps so the compute
-    # budget (and the LR cosine horizon) is fixed independent of dataset size T.
-    # That keeps the overfitting study clean: vary T at fixed steps to isolate the
-    # effect of data quantity (per-sample revisits = steps*batch/T) rather than
-    # confounding it with more gradient updates. steps_per_epoch is kept only for
-    # the epoch-denominated log line.
+    # schedule is in optimizer steps so the compute budget is fixed independent of T;
+    # steps_per_epoch is only for the epoch-denominated log line
     steps_per_epoch = len(train_loader)
     n_steps = cfg["n_steps"]
     val_every = cfg["val_every"]
@@ -168,8 +149,7 @@ def main(cfg=CFG):
     sde = VPSDE(N=cfg["sde_steps"])
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
 
-    # Linear warmup -> cosine decay over the full run (n_steps is known up front).
-    # "constant" leaves lr flat, so the schedule is a clean on/off ablation.
+    # linear warmup -> cosine decay; "constant" leaves lr flat (on/off ablation)
     warmup_steps = max(1, int(cfg.get("warmup_frac", 0.0) * n_steps))
     min_ratio = cfg.get("min_lr_ratio", 0.0)
 
@@ -267,11 +247,8 @@ def main(cfg=CFG):
 
     sample_cond = None
     if use_cond:
-        # Draw a REPRESENTATIVE sample of the val regime distribution. (The old
-        # val_cond[:n_samples] took the first matrices in time order -> one early
-        # block, skewing the conditioning toward whatever regime that slice is in.)
-        # A fixed generator keeps the conditioning identical across seeds, so the
-        # per-regime numbers reflect model variance, not cond-draw variance.
+        # representative draw from the val regime distribution; fixed generator so
+        # conditioning is identical across seeds (per-regime numbers reflect model variance)
         val_cond = val_ds.cond
         n = cfg["n_samples"]
         if n <= len(val_cond):
@@ -308,13 +285,10 @@ def main(cfg=CFG):
         Cov_all = torch.load(COV_PATH, weights_only=True).float()
         Cov_real = Cov_all[val_ds.idx]                    # val split (split-agnostic gather)
         Cov_train = Cov_all[train_ds.idx]                 # train split
-        # covariance + correlation of the same sampled matrices (model emits both)
         plot_sample_matrices(Cov_real, Sigma_gen, paths["samples"], show_cov=True)
         stats.update(variance_diagnostics(Cov_real, Sigma_gen, Sigma_train=Cov_train))
 
-        # conditional-fidelity eval: bin by trailing-vol regime (raw cond, available
-        # for DM and CDM alike) and compare real vs gen within each bin. CDM feeds the
-        # per-sample cond it was drawn at; DM has none -> its marginal is judged per bin.
+        # conditional-fidelity eval: bin by trailing-vol regime, compare real vs gen per bin
         if COND_PATH is not None:
             cond_val = torch.load(COND_PATH, weights_only=True).float().reshape(-1)[val_ds.idx]
             cond_gen = norm.denormalize_cond(sample_cond).reshape(-1).cpu() if use_cond else None
@@ -345,13 +319,9 @@ def aggregate_runs(runs):
 
 
 def distributional_fidelity_baselines(cfg=CFG):
-    """Reference + baseline rows for the part-1 tables, computed once and model-
-    independent (no DGP re-simulation):
-      * Train -- simulated-training stylized-fact means (the train reference row).
-      * LW    -- rolling Ledoit-Wolf at the val indices: stylized-fact means (for the
-                 values table) plus per-asset variance levels and the variance W1.
-    The simulated-validation reference and the SGM/SGCM columns come from the per-seed
-    runs. Returns {label: {key: (value, 0.0)}} -- single-set point estimates."""
+    """Model-independent reference rows for the part-1 tables: Train (simulated-
+    training stylized-fact means) and LW (rolling Ledoit-Wolf at the val indices:
+    fact means + variance levels/W1). -> {label: {key: (value, 0.0)}}."""
     if TARGET != "covariance":
         print("[dist-fidelity] baselines need TARGET='covariance'; skipping")
         return {}
@@ -366,7 +336,6 @@ def distributional_fidelity_baselines(cfg=CFG):
     pt = lambda d: {k: (float(v), 0.0) for k, v in d.items()}   # point estimate -> (val, 0)
     out = {}
 
-    # simulated-training stylized-fact means (the train reference row)
     out["Train"] = pt(fact_means(C_train))
 
     # Ledoit-Wolf baseline at the val indices: fact means + variance levels/W1
@@ -383,8 +352,7 @@ def distributional_fidelity_baselines(cfg=CFG):
         "w1_variance":     float(wasserstein_distance(var_real, var_lw)),
     }))
 
-    # LW per-regime W1 (bin-vs-bin, like SGCM): bin each LW estimate by the regime of
-    # its target index -- the trailing window makes LW implicitly regime-adaptive.
+    # LW per-regime W1 (bin-vs-bin): bin each LW estimate by its target index's regime
     if COND_PATH is not None:
         cond_full = torch.load(COND_PATH, weights_only=True).float().reshape(-1)
         cond_lw = cond_full[torch.from_numpy(np.asarray(keep))]
@@ -422,12 +390,8 @@ def _print_table(head_label, head_cols, rows):
         print(f"{label:>24s} | " + " | ".join(_fmt_cell(c) for c in cells))
 
 
-# --- Table 1: stylized-fact VALUES (Kubiak-style), rows = sets, cols = facts ------
-# Each row reads from a different key convention in `agg`:
-#   Simulated Training   -> agg["Train"]["{f}_mean"]        (point, from fact_means)
-#   Simulated Validation -> agg["SGM"]["{f}_mean_real"]     (the fixed val reference)
-#   SGM / SGCM           -> agg[model]["{f}_mean_gen"]      (across-seed mean)
-#   LW                   -> agg["LW"]["{f}_mean"]           (point, from fact_means)
+# Table 1: stylized-fact values, rows = sets, cols = facts. Each row reads a
+# different key convention in `agg` (see FACT_ROWS below).
 FACT_COLS = [
     ("offdiag",     "off-diag corr"),
     ("gini",        "Gini"),
@@ -446,9 +410,8 @@ FACT_ROWS = [
 
 
 def write_facts_values_table(agg):
-    """Table 1 -- mean stylized-fact VALUES per set (simulated train/val reference,
-    SGM, SGCM, LW); columns are the facts. Compare each set against the train/val
-    reference range (Kubiak-style), no W1 floor."""
+    """Table 1 -- mean stylized-fact values per set (train/val reference, SGM, SGCM,
+    LW); columns are the facts."""
     def value(src, key):
         d = agg.get(src, {}).get(key)
         return None if d is None else d[0]
@@ -468,15 +431,14 @@ def write_facts_values_table(agg):
             f"{'--':^14s}" if c is None else f"{c:^14.4f}" for c in cells))
 
 
-# --- Table 2: regime-specific W1, SGM vs SGCM ----------------------------------
+# Table 2: regime-specific W1, SGM vs SGCM
 REGIME_BINS = [("regime_pooled_", "pooled"), ("regime_lo_", "lo"),
                ("regime_mid_", "mid"), ("regime_hi_", "hi")]
 
 
 def write_regime_table(agg):
     """Table 2 -- per-regime W1 (off-diag + variance). SGM is the regime-blind
-    marginal-vs-bin baseline; SGCM (explicit conditioning) and LW (implicit, via its
-    trailing window) are both bin-vs-bin."""
+    marginal-vs-bin baseline; SGCM and LW are bin-vs-bin."""
     models = [c for c in ("SGM", "SGCM") if c in agg]
     if "LW" in agg and "regime_pooled_w1_offdiag" in agg["LW"]:
         models.append("LW")
@@ -494,7 +456,7 @@ def write_regime_table(agg):
     _print_table("regime", headers, rows)
 
 
-# --- Table 3: variance / scale (real vs generated) -----------------------------
+# Table 3: variance / scale (real vs generated)
 VAR_ROWS = [("mean variance", "mean"), ("median variance", "median"),
             ("W1 variance (to val)", "w1")]
 
@@ -523,12 +485,8 @@ def write_variance_table(agg):
 
 
 def run_experiments(seeds=SEEDS, variants=VARIANTS):
-    """Run every (variant, seed) combination, then assemble the part-1 result
-    tables. Model columns (SGM unconditional vs SGCM conditional) are aggregated
-    mean +- std across seeds; the simulated-training reference and LW baseline rows
-    come from distributional_fidelity_baselines(). Writes the full per-metric model
-    summary plus three focused tables: (1) stylized-fact values, (2) regime-specific
-    W1, (3) variance/scale."""
+    """Run every (variant, seed), aggregate SGM/SGCM mean +- std across seeds, add
+    the Train/LW reference rows, and write the summary plus the three part-1 tables."""
     agg = {}
     for label, override in variants.items():
         runs = []
@@ -537,8 +495,7 @@ def run_experiments(seeds=SEEDS, variants=VARIANTS):
             runs.append(main({**CFG, "seed": seed, **override}))
         agg[label] = aggregate_runs(runs)
 
-    # full per-metric model summary (SGM/SGCM only -- the baselines carry W1 facts
-    # only, so folding them into this dump would be mostly NaN).
+    # full per-metric model summary (SGM/SGCM only)
     metrics = sorted(set().union(*[set(a) for a in agg.values()]))
     out = ROOT / "results" / f"summary{SUFFIX}{TAG}.csv"
     with out.open("w", newline="") as f:
@@ -558,11 +515,10 @@ def run_experiments(seeds=SEEDS, variants=VARIANTS):
             cells.append(f"{mean:9.4f} ± {std:7.4f}")
         print(f"{m:>22s} | " + " | ".join(cells))
 
-    # part-1 result tables: add Train + LW reference rows, then write the three tables.
     agg.update(distributional_fidelity_baselines())
-    write_facts_values_table(agg)  # Table 1: stylized-fact values (train/val/SGM/SGCM/LW)
-    write_regime_table(agg)        # Table 2: regime-specific W1 (SGM vs SGCM)
-    write_variance_table(agg)      # Table 3: variance / scale (real vs generated)
+    write_facts_values_table(agg)  # Table 1: stylized-fact values
+    write_regime_table(agg)        # Table 2: regime-specific W1
+    write_variance_table(agg)      # Table 3: variance / scale
     return agg
 
 

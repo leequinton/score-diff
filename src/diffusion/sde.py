@@ -1,16 +1,7 @@
-"""Variance-preserving SDE (Song et al., 2021) for score-based diffusion.
-
-Forward process:
-    dx = -0.5 β(t) x dt + sqrt(β(t)) dW,    β(t) = β_min + t (β_max - β_min).
-
-At training and sampling we use the DDPM discretisation (Ho et al., 2020),
-which is equivalent to a unit-step Euler-Maruyama discretisation of the SDE.
-
-Shape-agnostic: every method accepts `x` of any rank and broadcasts the
-per-batch scalar coefficients across the trailing dimensions via `_bcast`.
-The bipartite (B, L, D) and log-covariance (N x N symmetric) models call the same
-methods on tensors of different shape.
-"""
+"""Variance-preserving SDE (Song et al., 2021) for score-based diffusion:
+    dx = -0.5 β(t) x dt + sqrt(β(t)) dW,   β(t) = β_min + t (β_max - β_min),
+discretised DDPM-style (Ho et al., 2020). Shape-agnostic: `_bcast` broadcasts the
+per-batch scalar coefficients across any trailing dims."""
 
 import torch
 
