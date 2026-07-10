@@ -64,6 +64,10 @@ demand and git-ignored.
 the distribution of portfolio volatility `sqrt(wᵀΣw)` per volatility regime against
 the DGP oracle and the Ledoit-Wolf / sample-covariance baselines.
 
+The following notebook can be viewed/copied to run the models:
+
+https://colab.research.google.com/drive/1G_G1WxlpVWM2wp-X7VMlUx3T2O7c7BQ8?usp=sharing
+
 ## Layout
 
 | Path | Contents |
