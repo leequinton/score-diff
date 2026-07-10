@@ -1,10 +1,6 @@
-"""Variance-preserving SDE (Song et al., 2021) for score-based diffusion:
-    dx = -0.5 β(t) x dt + sqrt(β(t)) dW,   β(t) = β_min + t (β_max - β_min),
-discretised DDPM-style (Ho et al., 2020). Shape-agnostic: `_bcast` broadcasts the
-per-batch scalar coefficients across any trailing dims."""
-
 import torch
 
+#VPSE of song et al 2021
 
 class VPSDE:
     def __init__(self, beta_min=0.1, beta_max=20, N=1000):
@@ -30,8 +26,7 @@ class VPSDE:
         return mean, std
 
     def discretize(self, x, t):
-        """DDPM-style discretisation. Returns (f, G) such that one reverse step is
-        x_{t-1} = x_t - rev_f + G · z   with rev_f = f - G^2 · score, z ~ N(0, I)."""
+        #ddpm discretization of the SDE
         timestep = (t * (self.N - 1) / self.T).long()
         beta = self.discrete_betas.to(x.device)[timestep]
         alpha = self.alphas.to(x.device)[timestep]

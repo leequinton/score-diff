@@ -1,12 +1,7 @@
-"""Denoising score matching loss (epsilon-prediction) for the log-covariance
-VP-SDE baseline. With `cond`, applies classifier-free-guidance dropout (Ho and
-Salimans, 2022) so one network does both conditional and unconditional sampling."""
-
 import torch
 
-
+# for cfg dropout, mask the cond input with a learned null embedding (for uncond model)
 def _cfg_mask(bs, cond, cond_dropout, device):
-    """(bs,) mask: True = use null embedding. None when nothing to drop."""
     if cond is None or cond_dropout <= 0.0:
         return None
     return torch.rand(bs, device=device) < cond_dropout
@@ -18,9 +13,8 @@ def sym_randn_like(X):
     z = torch.randn_like(X)
     return torch.triu(z) + torch.triu(z, 1).transpose(-1, -2)
 
-
+# desnoising score matching loss for a single symmetric matrix
 def vpsde_dsm_loss_logcov(model, sde, X0, eps_t=1e-3, cond=None, cond_dropout=0.1):
-    """DSM loss for a single symmetric matrix (log-covariance baseline)."""
     bs = X0.shape[0]
     N = X0.shape[-1]
     device = X0.device

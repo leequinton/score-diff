@@ -18,10 +18,8 @@ class TransformerBlock(nn.Module):
         h = h + self.ffn(self.ln2(h))
         return h
 
-
+# score network for predicting the injected noise in the matrix-log space of a symmetric matrix
 class LogCovScoreGNN(nn.Module):
-    """Score network for the symmetric matrix-log S = logm(Sigma).
-    x: (batch, N, N) symmetric, t: (batch,) in [0, 1] -> (batch, N, N) symmetric."""
 
     def __init__(self, n_assets, hidden_dim=128, n_layers=4, n_heads=4,
                  time_dim=128, dropout=0.0, cond_dim=0):

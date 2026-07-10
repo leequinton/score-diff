@@ -1,11 +1,8 @@
-"""Euler-Maruyama reverse-SDE sampler for the log-covariance baseline, with
-optional classifier-free guidance (Ho and Salimans, 2022): ε = (1+w)·ε_cond −
-w·ε_uncond, calling the model twice per step when w != 0."""
-
 import torch
 
 from src.diffusion.losses import sym_randn_like
 
+# Euler maruyama reverse-sde sampler for the log-covariance baseline, with optional classifier-free guidance
 
 def _cfg_combine(eps_cond, eps_uncond, w):
     return (1 + w) * eps_cond - w * eps_uncond
@@ -14,8 +11,6 @@ def _cfg_combine(eps_cond, eps_uncond, w):
 @torch.no_grad()
 def sample_logcov(model, sde, batch_size, n_assets, device, eps_t=1e-3,
                   cond=None, guidance_scale=0.0):
-    """Reverse-SDE Euler-Maruyama. The iterate stays symmetric: model output and
-    injected noise are symmetric, and the SDE coefficients preserve symmetry."""
     N = n_assets
     X = sym_randn_like(torch.empty(batch_size, N, N, device=device))
 

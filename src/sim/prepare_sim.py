@@ -1,12 +1,4 @@
-"""Convert the simulated DCC covariance path (data/sim_cov.npy) into the .pt tensors
-make_logcov_datasets consumes, matching the empirical pipeline's on-disk format:
-
-    data/processed/Cov_sim.pt  - covariances H_t                 (float32, T x N x N)
-    data/processed/C_sim.pt    - correlations D^-1/2 H_t D^-1/2  (float32, T x N x N)
-    data/processed/cond_sim.pt - causal trailing market vol       (float32, T x 1)
-
-The conditioning series is a strictly-lagged trailing realized vol (never sees H_t),
-a legitimate regime signal that an unconditional model lacks."""
+"""Convert the simulated DCC covariance path (data/sim_cov.npy) into the .pt tensors make_logcov_datasets consumes"""
 
 import numpy as np
 import pandas as pd

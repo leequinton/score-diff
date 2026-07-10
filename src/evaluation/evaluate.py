@@ -1,9 +1,3 @@
-"""Compare real vs generated correlation/covariance matrices via CorrGAN-style
-stylized facts (Marti et al.): mean off-diagonal correlation, eigenvalue Gini,
-cophenetic correlation (single/ward), Perron-Frobenius violation, and the
-eigenvalue power-law exponent, each scored by Wasserstein-1 against the val
-reference. Covariance adds a variance-scale W1."""
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -26,20 +20,17 @@ def to_correlation(Sigma):
     C = S / (d.unsqueeze(-1) * d.unsqueeze(-2))
     return C.clamp(-1.0, 1.0), (~valid).sum().item()
 
-
+# function for taking exp of log to get to desired cov matrix
 def logcov_to_covariance(S):
-    """Matrix-log S -> covariance Sigma = expm(S) = Q diag(exp w) Q^T (always SPD)."""
     w, Q = torch.linalg.eigh(S)
     return (Q * w.exp().unsqueeze(-2)) @ Q.transpose(-1, -2)
 
-
+# same as above but correlation matrices
 def logcov_to_correlation(S):
-    """Symmetric matrix-log S (N x N) -> normalized correlation matrices."""
     return to_correlation(logcov_to_covariance(S))
 
-
+# function for wasserstein distances of off-diagonals for corr matrices
 def w1_offdiag(C_real, C_gen):
-    """1-D Wasserstein-1 on the pooled distribution of off-diagonal correlations."""
     a = _offdiag(C_real).flatten().numpy()
     b = _offdiag(C_gen).flatten().numpy()
     return float(wasserstein_distance(a, b))
@@ -52,11 +43,8 @@ def eig_gini(eigs_desc):
     total = asc.sum(-1)
     return 2 * (asc * ranks).sum(-1) / (N * total) - (N + 1) / N
 
-
+# cophenetic correlations per matrix (higher means stronger hierarchical structure)
 def cophenetic_per_sample(C, method="single"):
-    """Cophenetic correlation per matrix using the Mantegna distance
-    d_ij = sqrt(2(1 - C_ij)) on the condensed upper triangle, with `method`
-    linkage ('single' or 'ward'). Higher = stronger hierarchical structure."""
     C_np = C.numpy() if hasattr(C, "numpy") else np.asarray(C)
     N = C_np.shape[-1]
     iu = np.triu_indices(N, k=1)
@@ -67,7 +55,7 @@ def cophenetic_per_sample(C, method="single"):
         out[i] = cophenet(Z, d)[0]
     return out
 
-
+# 
 def _leading_eigvec_neg_sum(C_np):
     """Perron-Frobenius violation: -sum of negative entries of the (sign-normalised)
     leading eigenvector. ~0 when the top eigenvector is all-positive. Returns (T,)."""
@@ -80,11 +68,8 @@ def _leading_eigvec_neg_sum(C_np):
         out[i] = -np.minimum(v, 0.0).sum()
     return out
 
-
+# power law exponent of the eigenval distribution per matrix
 def _powerlaw_alpha(eig_desc):
-    """Power-law exponent alpha of the eigenvalue distribution per matrix
-    (powerlaw.Fit). eig_desc: (T, N) descending. Returns (T,); NaN when the
-    `powerlaw` package is missing, so the rest of the eval still runs."""
     try:
         import powerlaw
     except ImportError:
@@ -98,9 +83,8 @@ def _powerlaw_alpha(eig_desc):
             out[i] = np.nan
     return out
 
-
+# wasserstein distance between two 1D arrays, safe to handle NaNs
 def _safe_w1(a, b):
-    """Wasserstein-1 that drops NaNs (e.g. powerlaw missing); NaN if a side empties."""
     a, b = a[~np.isnan(a)], b[~np.isnan(b)]
     if len(a) == 0 or len(b) == 0:
         return float("nan")
@@ -132,12 +116,8 @@ def _per_matrix_facts(C):
         "powerlaw":    _powerlaw_alpha(eig_desc),
     }
 
-
+# W1 on diagonals of Sigma, also mean and median levels
 def variance_diagnostics(Sigma_real, Sigma_gen, Sigma_train=None):
-    """Scale fidelity: W1 on the pooled per-asset variances (diagonals of Sigma),
-    plus mean/median levels. When Sigma_train is given, also reports train stats and
-    gen-vs-train W1, to separate reconstruction bias from train/val regime shift.
-    All inputs are (T, N, N) covariance batches."""
     var_real = torch.diagonal(Sigma_real, dim1=-2, dim2=-1).flatten().numpy()
     var_gen  = torch.diagonal(Sigma_gen,  dim1=-2, dim2=-1).flatten().numpy()
 
@@ -177,27 +157,16 @@ def _corr_offdiag_pooled(Sigma):
 def _var_pooled(Sigma):
     return torch.diagonal(Sigma, dim1=-2, dim2=-1).flatten().numpy()
 
-
+# evaluation of regime fidelity, binned by quantiles of the trailing-vol regime signal
 def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
                        bin_labels=("lo", "mid", "hi")):
-    """Conditional-fidelity eval. Bin the trailing-vol regime by quantiles of
-    `cond_real`; within each bin compare real vs generated off-diagonal correlation
-    and per-asset variance via W1.
-
-    cond_real: (T,) regime value aligned with Sigma_real (val, raw space).
-    cond_gen:  (n,) regime value each generated matrix was drawn at. If None
-               (unconditional), the whole generated set is compared to every bin --
-               a marginal generator cannot match per-regime, which this surfaces.
-
-    So cond_gen given -> bin-vs-bin (conditional fidelity); cond_gen None ->
-    full-marginal-vs-bin. regime_pooled_* is the no-binning row, same machinery."""
     cond_real = _np1d(cond_real)
     edges = np.quantile(cond_real, np.linspace(0, 1, len(bin_labels) + 1))
     edges[0], edges[-1] = -np.inf, np.inf
     cg = _np1d(cond_gen) if cond_gen is not None else None
 
     def block(Sr_full, Sg_full, pre):
-        """One real-vs-gen W1 comparison, shared by the pooled row and every bin."""
+        # One real-vs-gen W1 comparison, shared by the pooled row and every bin
         Sr = _subsample(Sr_full, FACT_SUBSAMPLE)
         # count degenerate (non-positive diagonal) gen matrices; ~0 for expm covariances
         d = torch.diagonal(Sg_full, dim1=-2, dim2=-1)
@@ -229,22 +198,16 @@ def regime_binned_eval(cond_real, Sigma_real, Sigma_gen, cond_gen=None,
 
     return out
 
-
+# stylized facts for correlation
 def fact_means(C):
-    """Mean stylized-fact values over a correlation batch (for the reference/LW
-    rows): pooled off-diagonal mean plus each per-matrix fact meaned over a
-    FACT_SUBSAMPLE subsample. -> {offdiag_mean, gini_mean, ...}."""
     f = _per_matrix_facts(_subsample(C, FACT_SUBSAMPLE))
     out = {"offdiag_mean": float(_offdiag(C).flatten().mean())}
     for n in FACT_NAMES:
         out[f"{n}_mean"] = float(np.nanmean(f[n]))
     return out
 
-
+# LW shrinkage estimator for benchmark
 def ledoit_wolf(X):
-    """Ledoit-Wolf (2004) scaled-identity shrinkage covariance from X (n_obs, N):
-    shrinks the sample covariance toward mu*I by the optimal Frobenius-loss
-    intensity, using the closed-form (vectorised) shrinkage constant."""
     X = np.asarray(X, dtype=np.float64)
     n, N = X.shape
     X = X - X.mean(0, keepdims=True)
@@ -257,11 +220,8 @@ def ledoit_wolf(X):
     shrink = 0.0 if d2 <= 0 else b2 / d2
     return shrink * mu * np.eye(N) + (1.0 - shrink) * S
 
-
+# rolling lw covariances for a given set of returns and indices, with a trailing window
 def rolling_lw_covariances(returns, idx, window):
-    """Strictly-causal trailing Ledoit-Wolf covariance at each t in `idx`, from
-    returns[t-window:t] (excludes t; t < window dropped).
-    -> (m, N, N) float32 tensor, plus the kept indices."""
     returns = np.asarray(returns)
     idx = np.asarray(idx)
     keep = idx[idx >= window]
@@ -270,11 +230,8 @@ def rolling_lw_covariances(returns, idx, window):
         out[j] = ledoit_wolf(returns[t - window:t])
     return torch.from_numpy(out).float(), keep
 
-
+# rolling sample covariances for benchmark
 def rolling_sample_covariances(returns, idx, window):
-    """Strictly-causal trailing *sample* covariance -- the unshrunk counterpart of
-    rolling_lw_covariances, sharing its causal convention (returns[t-window:t]).
-    -> (m, N, N) float32, plus kept indices."""
     returns = np.asarray(returns, dtype=np.float64)
     idx = np.asarray(idx)
     keep = idx[idx >= window]
@@ -291,12 +248,8 @@ def _normalize_cov_np(M):
     d = np.sqrt(np.clip(np.diagonal(M, axis1=-2, axis2=-1), 1e-12, None))
     return np.clip(M / (d[:, :, None] * d[:, None, :]), -1.0, 1.0)
 
-
+# plotting random heatmaps of real vs generated, cov and corr 
 def plot_sample_matrices(real, gen, save_path, n=2, seed=0, show_cov=True):
-    """Heatmap grid: n real (top) vs n generated (bottom) matrices. With show_cov,
-    two column groups (covariance + correlation of the same samples); otherwise just
-    correlation. Covariance uses a sequential PowerNorm(gamma=0.5) up to the real
-    99th-percentile; correlation uses a fixed [-1, 1] scale."""
     rng = np.random.default_rng(seed)
     n = min(n, len(real), len(gen))
     ridx = rng.choice(len(real), size=n, replace=False)
@@ -352,7 +305,7 @@ def eval_and_plot(C_real, C_gen, save_path, n_inv_gen=0):
 
     titles = {"gini": "Eigenvalue Gini", "coph_single": "Cophenetic (single)",
               "coph_ward": "Cophenetic (ward)", "perron": "Perron-Frobenius neg-sum",
-              "powerlaw": "Eigenvalue power-law α"}
+              "powerlaw": "Eigenvalue power-law exponent"}
     panels = [("Off-diagonal correlation", off_real, off_gen, w_off, (-1, 1), 80)]
     for n in FACT_NAMES:
         a, b = facts_real[n], facts_gen[n]

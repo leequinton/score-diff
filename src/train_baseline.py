@@ -83,7 +83,7 @@ CFG = dict(
     log_every=100,         # in steps (logging granularity, not the train schedule)
     ema_decay=0.999,
     sde_steps=1000,
-    n_samples=3000,        # ~1000 per regime bin (3 bins)
+    n_samples=3000,        # 1000 per regime bin (3 bins)
     eps_t=1e-3,
     seed=42,
     cond_dim=1,  # sim: trailing market vol (1-D)
@@ -98,7 +98,7 @@ VARIANTS = {
     "SGCM": {"cond_dim": 1},
 }
 
-# Ledoit-Wolf baseline: trailing window (~1 trading year) for the rolling OOS estimate
+# LW baseline: trailing window (~1 trading year) for the rolling OOS estimate
 LW_WINDOW = 252
 
 
@@ -390,8 +390,7 @@ def _print_table(head_label, head_cols, rows):
         print(f"{label:>24s} | " + " | ".join(_fmt_cell(c) for c in cells))
 
 
-# Table 1: stylized-fact values, rows = sets, cols = facts. Each row reads a
-# different key convention in `agg` (see FACT_ROWS below).
+# Table 1: stylized-fact values, rows = sets, cols = facts. Each row reads a different key convention in `agg` (see FACT_ROWS below).
 FACT_COLS = [
     ("offdiag",     "off-diag corr"),
     ("gini",        "Gini"),
@@ -484,9 +483,8 @@ def write_variance_table(agg):
     _print_table("metric", cols, rows)
 
 
+# running over multiple seeds and variants, aggregating the results into summary tables
 def run_experiments(seeds=SEEDS, variants=VARIANTS):
-    """Run every (variant, seed), aggregate SGM/SGCM mean +- std across seeds, add
-    the Train/LW reference rows, and write the summary plus the three part-1 tables."""
     agg = {}
     for label, override in variants.items():
         runs = []

@@ -1,9 +1,3 @@
-"""Log-covariance baseline dataset. Loads correlation/covariance matrices, takes
-the matrix log S = logm(Sigma), normalizes per-entry on the train split, and does
-a temporal train/val split with an optional gap. Optionally loads a per-window
-conditioning variable (e.g. trailing market vol). The matrix log makes the target
-unconstrained; the eigendecomposition is pure preprocessing (no gradient)."""
-
 import torch
 from torch.utils.data import Dataset
 

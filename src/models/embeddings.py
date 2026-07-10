@@ -15,10 +15,8 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
+# conditioning vector with the learned null token for classifier-free guidance
 class CondEmbedding(nn.Module):
-    """Conditioning vector -> (B, hidden_dim) bias, with a learned null token for
-    classifier-free guidance (Ho and Salimans, 2022). cond=None or masked entries
-    use the null embedding; the mask implements CFG dropout."""
 
     def __init__(self, cond_dim, hidden_dim):
         super().__init__()
