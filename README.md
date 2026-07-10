@@ -1,6 +1,6 @@
 # graph_diffusion
 
-Score-based diffusion for **covariance matrices** of asset returns, trained and
+Score-based diffusion for covariance matrices of asset returns, trained and
 evaluated on a calibrated DCC-GARCH simulation.
 
 The model diffuses the **matrix logarithm** `S = logm(Σ)` of a covariance (or
@@ -13,7 +13,7 @@ network (`LogCovScoreGNN`) predicts the noise in a variance-preserving SDE
 Regime conditioning (trailing market volatility) is supported via classifier-free
 guidance, giving two variants that are compared throughout:
 
-- **SGM** — unconditional score-based generative model (regime-blind).
+- **SGM** — unconditional score-based generative model.
 - **SGCM** — conditional model, conditioned on the trailing-vol regime.
 
 Because the data-generating process is a known DCC-GARCH, the true conditional
@@ -26,8 +26,7 @@ measured directly rather than against a proxy.
 pip install -r requirements.txt
 ```
 
-Raw data is **not** versioned; it is regenerated from public sources. Place these
-in `data/raw/`:
+Raw data is regenerated from public sources. Place these in `data/raw/`:
 
 - `49_Industry_Portfolios_Daily.csv` (Kenneth French data library, value-weighted)
 - `F-F_Research_Data_5_Factors_2x3_daily.csv` (Kenneth French data library)
